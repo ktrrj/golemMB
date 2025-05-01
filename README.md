@@ -1,4 +1,4 @@
-# golemMB: A Shiny App for 16S rRNA Amplicon Analysis
+# golemMB: A Shiny App for 16S rRNA Gene Amplicon Sequence Analysis
 
 **golemMB** is a Shiny application developed to streamline and document 16S rRNA gene amplicon sequencing analysis from the count table onward in a reproducible, modular workflow. It supports data import into `phyloseq`, alpha and beta diversity analysis, differential abundance, functional predictions via PICRUSt2, BugBase phenotype visualization, and correlation analysis between microbial taxa and numeric metadata.
 
