@@ -1,0 +1,504 @@
+---
+title: "Plot and analyze alpha diversities"
+author: "`r params$author`"
+date: "`r format(Sys.time(), '%d.%m.%y')`"
+header-includes:
+- \usepackage{float} #use the 'float' package
+- \floatplacement{figure}{H} #make every figure with caption = h
+- \usepackage{flafter}
+- \usepackage{booktabs}
+- \usepackage{longtable}
+- \usepackage{array}
+- \usepackage{multirow}
+- \usepackage{wrapfig}
+- \usepackage{colortbl}
+- \usepackage{pdflscape}
+- \usepackage{tabu}
+- \usepackage{threeparttable}
+- \usepackage{threeparttablex}
+- \usepackage[normalem]{ulem}
+- \usepackage{makecell}
+- \usepackage{xcolor}
+output:
+  pdf_document:
+    latex_engine: lualatex
+    fig_width: 7.5
+    fig_caption: yes
+    df_print: kable
+    extra_dependencies: ["float"]
+    includes:
+      in_header: header.tex
+  word_document: default
+  html_document:
+    df_print: kable
+    theme: cerulean
+    highlight: haddock
+    toc: yes
+    toc_depth: 3
+    toc_float: TRUE
+    collapsed: FALSE
+    smooth_scroll: TRUE
+    code_fold: show
+params:
+  author:
+    label: "author of the analysis"
+    value: "no author given"
+  workdir:
+    label: "working directory"
+    value: "U:/00_Shiny/Test"
+  subfolder:
+    label: "subdirectory"
+    value: !r format(Sys.time(), '%y%m%d')
+  TU_type:
+    label: "type of taxonomic units analyzed"
+    value: OTU
+    choices: [ZOTU, OTU]
+  var_test:
+    label: "metadata variable used for statistical analysis and plotting"
+    value: NULL
+  var_formula:
+    label: "metadata variable(s) formula used for statistical analysis"
+    value: NULL
+  var_name:
+    label: "variable name for plotting"
+    value: NULL
+  comp_list:
+    label: "list of length-2 character vectors defining comparisons or 'all' for all possible pairs, NULL for no stats"
+    value: !r "all"
+  color_set:
+    label: "define colors, optionally as named vector"
+    value: !r NULL
+  label_set:
+    label: "named vector for plot (x/legend) labels"
+    value: !r NULL
+  label_set_b:
+    label: "named vector for grouped plot (color legend) labels"
+    value: !r NULL
+  alpha_vars:
+    label: "alpha diversity metric(s) to plot"
+    value: !r c("Observed", "Chao1", "ACE", "Shannon", "Simpson", "InvSimpson", "Fisher")
+    choices: [Observed, Chao1, ACE, Shannon, Simpson, InvSimpson, Fisher]
+  min_repl:
+    label: "minimum number of group replicates to calculate statistics"
+    value: 3
+  rm_ns:
+    label: "whether or not remove non-significant comaprisons from plot"
+    value: TRUE
+    choices: [TRUE, FALSE]
+  padj_method:
+    label: "set p value adjustment method"
+    value: fdr
+    choices: [holm, hochberg, hommel, bonferroni, BH, BY, fdr, none]
+  cutoff_pval:
+    label: "cutoff for (adj.) p value"
+    value: 0.05
+  rel_step:
+    label: "relative step height between comparison lines"
+    value: 6
+  grouped:
+    label: "Doing grouped plotting or not"
+    value: FALSE
+    choices: [TRUE, FALSE]
+  dodge_value:
+    label: "amount of dodging for grouped plots"
+    value: 0.9
+  color_param:
+    label: "variable name defining color/shape in grouped plots"
+    value: NULL
+  data_param:
+    label: "variable name defining x-axis in grouped plots"
+    value: NULL
+fontsize: 10pt
+urlcolor: blue
+papersize: a4
+editor_options: 
+  chunk_output_type: console
+---
+```{r version, echo = FALSE}
+script_version <- "1.52"
+#script_date <- file.info("C:\\MyFolder\\test.csv")$mtime
+```
+This is 'Plot and analyze alpha diversities' script version **`r script_version`** by Dr. Roman Gerlach.
+
+## Load required libraries
+```{r libraries, warning = FALSE, message = FALSE}
+setProgress(0.2, message = "Loading required libraries...")
+library(tidyverse)
+library(ggpubr)
+library(rstatix)
+library(ggtext)
+library(pander)
+library(RColorBrewer)
+library(egg)
+library(patchwork)
+library(broom)
+library(kableExtra)
+```
+
+```{r global_options, echo = FALSE}
+# Set up global options for nice reports and keeping figures:
+workdir <- params$workdir
+current_dir <- paste(workdir, params$subfolder, sep = "/")
+knitr::opts_chunk$set(fig.width = 7.5, fig.align = "center", out.extra = "",
+                      warning = FALSE, message = FALSE, fig.pos = "!H",
+                      cache.path = current_dir,
+                      dev = "cairo_pdf")
+options(knitr.kable.NA = '')
+
+```
+```{r environment, echo = FALSE}
+# setting TU type
+TU_type <- ifelse(params$TU_type == "OTU", FALSE, TRUE)
+
+# set file name depending on TU type
+alpha_file <- ifelse(TU_type, input$uploadZOTUalpha$datapath, input$uploadOTUalpha$datapath)
+
+# check and create directory structure
+# if(!dir.exists(paste0(current_dir, "/alpha_diversity"))) {dir.create(paste0(current_dir, "/alpha_diversity"))}
+# if(!dir.exists(paste0(current_dir, "/alpha_diversity/data"))) {dir.create(paste0(current_dir, "/alpha_diversity/data"))}
+# if(!dir.exists(paste0(current_dir, "/alpha_diversity/figures"))) {dir.create(paste0(current_dir, "/alpha_diversity/figures"))}
+# source accessory functions, e.g. for working with phyloseq objects
+# source("../helper_functions/functions_accessory.R", local = knitr::knit_global())
+# source("../helper_functions/functions_import.R", local = knitr::knit_global())
+# source("../helper_functions/functions_plotting.R", local = knitr::knit_global())
+set.seed(42)
+
+```
+
+## 1. Setting up environment and script parameters
+Type of imported taxonomic units (TUs)
+`r ifelse(params$TU_type == "OTU", paste0("Taxonomic data is present in the form of **OTUs** (Operational Taxonomic Units)."), paste0("Taxonomic data is present in the form of **ZOTUs/ASVs** (Zero-radius Operational Taxonomic Units/Amplicon Sequence Variants)."))`
+
+Import the following list containing the pre-calculated alpha diversity measures:
+
+\footnotesize
+``r alpha_file``
+\normalsize
+
+A filtered data set **after** removal of excluded and outlier samples is analyzed.
+```{r data_import, echo = FALSE}
+####~~~~~ Import alpha diversity data ~~~~####
+incProgress(0.2, message = "Importing calculated alpha diversities...")
+# read list of alpha diversity list to workspace
+alpha.list <- readRDS(file = alpha_file)
+
+# import sample-filtered alpha diversity data
+alpha_df <- alpha.list[["no_out"]]
+
+# vector of alpha diversity measures used for plotting
+measure.vars <- params$alpha_vars
+# translate measure names in proper designations 
+measure.names <- c(
+  "Observed" = "Observed", "Chao1" = "Chao1 index",
+  "ACE" = "ACE index", "Shannon" = "Shannon index",
+  "Simpson" = "Simpson index",
+  "InvSimpson" = "Inverse Simpson index", "Fisher" = "Fisher's alpha")
+```
+### 1.1 Alpha diversity measures
+
+All alpha diversity measures were calculated from **non-normalized** counts using the [`phyloseq`](https://joey711.github.io/phyloseq/) package. Normalization is generally not adviced because most alpha diversity methods will be most effective when provided with the originally-observed count values. For more information see [Gotelli NJ & Colwell RK, Ecology Lett. 2001](https://doi.org/10.1046/j.1461-0248.2001.00230.x) and [McMurdie PJ & Holmes S, PLoS Comp. Biol. 2014](https://doi.org/10.1371/journal.pcbi.1003531).    
+The following alpha diversity measures were analyzed:
+
+`r pander::pander(measure.vars)`
+
+* **Observed** = or *richness* is the number of observed OTUs / species. There is no correction for taxa not observed.
+* **Chao1 index** = The metric assumes that the number of OTUs / species has a poisson distribution and corrects for variance. It is useful for data sets skewed toward low-abundance calls.
+* **ACE index** = **a**bundance-based **c**overage **e**stimators. ACE uses an arbitrary abundance threshold to label the number of abundant and rare taxa. The metric basically inflates the number of of rare taxa and inflates again the the number of taxa which are present in all samples (abundance = 1). 
+* **Shannon index** = The Shannon index is a measure of entropy (unit in bits if base 2 logarithm is used) and summarizes the diversity in the population while assuming all species are represented in a sample and they are randomly sampled. The Shannon index increases as both the richness and evenness of the community increase.
+* **Simpson index** = The Simpson diversity index is used to calculate a measure of diversity taking into account the number of taxa as well as the abundance. The simpson index gives more weight to common or dominant species which means a few rare species with only a few representatives will not affect the diversity of the sample.
+* **Inverse Simpson index** = The inverse of the Simpson index illustrates differences better in most of the cases. 
+* **Fisher's alpha** = Fisher proposed ([Fisher *et al*. 1943](https://www.jstor.org/stable/1411)) that sampled species abundances would follow a negative binomial from which the zero abundance class (species too rare to be sampled) was eliminated. It was also assumed that the total number of species in a community was infinite. The small number of abundant species and the large proportion of 'rare' species (the class containing one individual is always the largest) predicted by this log series model suggest that, like the geometric series, it will be most applicable in situations where one or a few factors dominate the ecology of a community. 
+
+For more information on the different measures see [Willis AD, Front. Microbiol., 2019](https://doi.org/10.3389/fmicb.2019.02407) and Wikipedia [here](https://en.wikipedia.org/wiki/Alpha_diversity), [here](https://en.wikipedia.org/wiki/Diversity_index) and [here](https://en.wikipedia.org/wiki/Relative_species_abundance).
+
+### 1.2 Define contrasts
+Two group comparisons are defined by a list of character vectors of length two. The list is used to filter from all possible comparisons. The order of the two elements is irrelevant. Depending on data distribution, either *t*-test (normal distribution) or Wilcoxon rank sum test (non-normal distribution) is applied.         
+The following factor levels of variable **`r params$var_test`** are compared:
+`r if(typeof(params$comp_list) == "list") {pander::pander(params$comp_list)} else if(typeof(params$comp_list) == "character" & params$comp_list == "all") {"Doing all possible comparisons."}`
+
+A function is used to check whether the list with pairwise comparisons is valid:
+
+```{r analysis_vars, echo = FALSE}
+# variable to analyze
+var_test <- params$var_test
+var_formula <- params$var_formula
+var_name <- params$var_name
+measure.vars <- params$alpha_vars
+# import comparison list
+comp.list <- params$comp_list
+```
+
+`r pander::pander(check_comp_list(x = comp.list, ref = alpha_df))`
+
+### 1.3 Parameters for statistical analyses
+
+The following parameters were used of for statistical comparison of alpha diversities: 
+
+* var_test    = **`r pander::pander(var_test)`**
+* var_formula    = `r pander::pander(params$var_formula)`
+* var_name    = **`r pander::pander(params$var_name)`**
+* Do statistical analysis of comparisons: **`r if(!is.null(params$comp_list)) "yes" else "no"`**
+* Minimum number of within-group replicates to do statistics: **`r params$min_repl`**
+* *p*-value adjustment method = **`r pander::pander(params$padj_method)`**
+* Threshold for significance: **`r params$cutoff_pval`**
+* Remove non-significant comparisons: **`r if(params$rm_ns) "yes" else "no"`**
+* Relative step width between individual significance brackets = **`r params$rel_step`%**
+
+```{r plot_parameters, echo = FALSE}
+# statistics parameters
+incProgress(0.2)
+do.stat <- params$do_stat
+rm.ns <- params$rm_ns
+min_repl <- params$min_repl
+p.adj.method <- params$padj_method
+cutoff_pval <- params$cutoff_pval
+# define space between single stat comparison bars in relative (% of max) y units
+rel.step <- params$rel_step
+# grouped plot settings
+grouped <- if(params$grouped & !is.null(params$color_param) & !is.null(params$data_param)) TRUE else FALSE
+dodge.value <- params$dodge_value
+color.param <- if(grouped) params$color_param else NULL
+data.param <- if(grouped) params$data_param else NULL
+
+# color and label sets
+color.set <- params$color_set
+label.set <- params$label_set
+label.set.b <- params$label_set_b
+
+```
+**Plot settings:**
+`r if(params$grouped & !is.null(params$color_param) & !is.null(params$data_param)) {paste0("Doing grouped plotting using variable '", params$color_param, "' for ", ifelse(!is.null(params$color_set), "coloring", "shape"), " and variable '", params$data_param, "' for categories.")} else if(params$grouped & (is.null(params$color_param) | is.null(params$data_param))) {paste("Color or data variable not defined for grouped plotting - Doing ungrouped plot!")} else if(!params$grouped) paste("Doing ungrouped plotting.")`
+
+color set:
+`r show_color_set(color.set)`
+
+label set:
+`r if(grouped) show_label_set(label.set.b) else show_label_set(label.set)`
+
+### 1.4 Determine mode of data distribution
+The pairwise statistical comparisons should only be done for factor levels of variable ``r var_test`` with at least **`r min_repl`** replicates.  Therefore, a function is applied to identify groups with less than `r min_repl` replicates. The corresponding samples are subsequently removed before analyses.
+
+```{r check_replicates, echo = FALSE}
+# before = alpha_df
+# group_param = "day_arginine" #"arginine2" #"day_arginine"
+# min_repl = 3
+# low_replicates <- filtered_levels(before = alpha_df, group_param = "day_arginine", min.repl = 3)
+low_replicates <- filtered_levels(before = alpha_df)
+```
+`r if(is.null(low_replicates[[1]])) paste("Each group had at least", min_repl, "replicates. No samples were removed.")`
+```{r low_replicates_tbl, eval = !is.null(low_replicates[[2]]), echo = FALSE, out.extra = ''}
+# using captions in combination with kable_style position options requires to escape '_' with '\\'
+ kbl(low_replicates[[2]], caption = paste("Overview of the factor levels of variable", str_replace_all(var_test, "_", "\\\\_"), "removed before statistical analyses because of low number of replicates (Frequency)."),
+ booktabs = TRUE, linesep = "", digits = 3, format.args = list(big.mark = ",")) %>%
+ kable_styling(latex_options = c("striped", "HOLD_position"))
+```
+
+The Shapiro test is used to determine whether the data underlying a alpha diversity measure is normal distributed or not. This is done after removing factor levels with low number of replicates (see above).    
+When the data *is* normal distributed (Shapiro test *p* > 0.05), the *t*-test is applied for pairwise comparisons. This parametric test compares the *means* of two groups and assumes that the data are (1) independent, (2) approximately normally distributed and (3) have similar amounts of variance within each group being compared. The null hypothesis is that the true difference between these group means is zero.     
+When the data is *not* normally distributed (Shapiro test *p* < 0.05), the Wilcoxon rank sum test is applied for pairwise comparisons. This nonparametric statistical test can be used to investigate whether two independent cohorts consist of samples that were selected from populations having the same alpha diversity distribution. The null hypothesis thereby is that the probability that a randomly selected value from one cohort is less than a randomly selected value from a second cohort is equal to the probability of being greater.   
+
+```{r norm_check_fct, echo = FALSE}
+# function to check for normal distribution of data
+norm_test <- function(df) {
+  x <- df %>%
+    group_by(measure) %>%
+    dplyr::summarize(Shapiro.test = shapiro.test(value)$p.value) %>%
+    # return "Wilcoxon" for non-normal and "t-test" for normal distribution
+    mutate(
+      Normal.dist = ifelse(Shapiro.test < 0.05, "no", "yes"),
+      Stat.test = ifelse(Shapiro.test < 0.05, "Wilcoxon", "t-test")) %>%
+    dplyr::select(Measure = measure, Shapiro.test, Normal.dist, Stat.test)
+}
+```
+```{r stats_table, eval = length(measure.vars) != 0, echo = FALSE}
+# check data distribution
+if(!is.null(low_replicates[[1]])) {
+  stat_used <- norm_test(filter(alpha_df, !get(var_test) %in% low_replicates[[1]]))
+  } else {stat_used <- norm_test(alpha_df)}
+
+# display summary df using kable
+# using captions in combination with kable_style position options requires to escape '_' with '\\'
+ kbl(stat_used, caption = "Overview of data distribution of alpha diversity measures. The Shapiro test (Shapiro.test) was used to determine whether the data is normal distributed or not (Normal.dist). The resulting appropriate test (t-test or Wilcoxon rank sum test) for pairwise comparisons (Stat.test) is shown.",
+ booktabs = TRUE, linesep = "", digits = 3, format.args = list(big.mark = ",")) %>%
+ kable_styling(latex_options = c("striped", "HOLD_position"))
+```
+## 2. Plotting functions
+
+### 2.1 Function for single parameter plotting
+
+The main function `plot_box_scatter` performs pairwise comparisons with the appropriate statistical test (Wilcoxon rank sum or *t*-test). The `add_xy_position` function from the [`rstatix`](https://github.com/kassambara/rstatix) package is used to prepare a data frame for manual plotting of error bars. Plotting is done using the `ggplot2` geom `stat_pvalue_manual` from the [`ggpubr`](https://rpkgs.datanovia.com/ggpubr/) package with the filtered `rstatix`-derived data frame as input.
+
+### 2.2 Function to loop through all parameters
+
+With the function `plot_box_scatter_list` the `plot_box_scatter` function is applied to all alpha diversity measures defined in `measure.vars`. The result is a list of plots which are combined to a single figure using the [`patchwork`](https://patchwork.data-imaginist.com/) package. 
+
+```{r box_scatter_loop, echo = FALSE}
+incProgress(0.2, message = "Plotting alpha diversities...")
+# function to loop through all alpha diversity variables
+# min_repl = 3
+# low_replicates <- filtered_levels(before = alpha_df)
+# var_test = "group"
+# var_name = "ASD vs. Control"
+# measure.vars = c("Observed", "Chao1", "ACE", "Shannon",
+#                                   "Simpson", "InvSimpson")
+# color.set <- c("Control" = "chartreuse3", "ASD" = "darkorchid4")
+# do_stat = TRUE
+# which_stat = "t-test"
+# p.adj.method = "fdr"
+# comp.list =   list(
+# c("ASD", "Control")
+#   )
+# rm.ns = TRUE
+# rel.step = 6
+# label.set = c(
+#   "Control" = "control", "ASD" = "ASD"
+# )
+# label.set.b = NULL
+# grouped = FALSE
+# dodge.value = 0.9
+# color.param = NULL
+# data.param = NULL
+# cutoff_pval = 0.05
+
+plot_box_scatter_list <- function(
+    measure_vars. = measure.vars, #measure.vars, #c("Observed", "Chao1", "ACE", "Shannon", "Simpson", "InvSimpson", "Fisher")
+    df. = alpha_df,
+    group_param. = var_test,
+    group_name. = var_name,
+    comp_list. = comp.list,
+    p_adj_method. = p.adj.method,
+    rm_ns. = rm.ns,
+    rel_step. = rel.step,
+    label_set. = label.set,
+    label_set_b. = label.set.b,
+    color_set. = color.set, #NULL, #color.set,
+    do_grouped_pt. = grouped,
+    dodge_value. = dodge.value,
+    color_param. = color.param,
+    data_param. = data.param) {
+  # remove samples with no data in group_param
+  df. <- df.[as.vector(!is.na(df.[, group_param.])), ]
+  # initiate empty list to store plots
+  plot.list <- setNames(vector("list", length(measure_vars.)), measure_vars.)
+  
+  # loop through all alpha diversity vars within measure_vars vector
+  for (i in measure_vars.) {
+    plot.list[[i]] <- plot_box_scatter(
+      df.. = df.,
+      group_param.. = group_param.,
+      group_name.. = group_name.,
+      measure_param = i,
+      which_stat = pull(stat_used[stat_used$Measure == i, "Stat.test"]),
+      comp_list.. = comp_list.,
+      p_adj_method.. = p_adj_method.,
+      rm_ns.. = rm_ns.,
+      rel_step.. = rel_step.,
+      label_set.. = label_set.,
+      label_set_b.. = label_set_b.,
+      color_set.. = color_set.,
+      do_grouped_pt.. = do_grouped_pt.,
+      dodge_value.. = dodge_value.,
+      color_param.. = color_param.,
+      data_param.. = data_param.,
+	  legend_rows = 3)
+  }
+  plot.list
+}
+
+# do the plotting
+fig <- plot_box_scatter_list()
+
+# save rds for debugging..
+saveRDS(fig, file = paste(
+  output_dir5, paste0(ifelse(TU_type, "ZOTUs.", "OTUs."),
+                          "alpha_figs.rds"), sep = "/"))
+```
+```{r combine_plots, echo = FALSE}
+# library(patchwork)
+fig.out <- patchwork::wrap_plots(fig) &
+  theme(legend.position = "bottom",
+        # plot.margin = margin(t = -0.4, r = -0.3, b = -0.3, l = 0, unit = "cm"),
+        plot.margin = margin(t = -0.4, r = -0.3, b = -0.3, l = 0, unit = "cm"),
+        # legend.margin = margin(t = -0.5, l = 6, unit = "cm")) #top, right, bottom, left
+        legend.margin = margin(t = 0, l = 1, b = ifelse(
+         grouped | (is.null(color.set) & !grouped), 5/(max(nchar(label.set))), 0), unit = "cm")) #top, right, bottom, left
+
+fig.out <- fig.out +
+            guide_area() +
+            plot_layout(
+              ncol = 3,
+              widths = unit(c(length(unique(pull(alpha_df[, var_test]))) + 0.5),
+                            c('cm')),
+              heights = unit(c(rep(6.5, 2), 1.8), 'cm'), # 4th value: height of collected guide
+              guides = 'collect'
+            )
+
+# https://patchwork.data-imaginist.com/articles/guides/annotation.html
+fig.out <-  fig.out + plot_annotation(tag_levels = 'A')
+
+# figure export settings
+fig_name <- paste(ifelse(TU_type, "ZOTUs", "OTUs"), var_test, p.adj.method, "alpha.png", sep = ".")
+fig_path <- paste(output_dir5, "figures", fig_name, sep = "/")
+fig_width <- length(unique(pull(alpha_df[, var_test])))*3 + 7.5
+
+# save file
+ggsave(filename = fig_path, plot = fig.out,
+       width = fig_width, height = ifelse(
+         grouped | (is.null(color.set) & !grouped), 21.5+0.2*max(nchar(label.set)) , 21),
+       units = "cm", dpi = 300, bg = "white")
+```
+\newpage
+```{r show_overviews, echo = FALSE, out.width = "17cm", out.height = "23cm", fig.align = 'center', fig.cap = paste("Pairwise comparisons of the different alpha diversity measures. Comparisons were done as indicated.", low_replicates[[3]], "Either Wilcoxon or t-test was used (see Table above) to calculate significance which was defined as follows: * = adj. p < 0.05, ** = adj. p < 0.01 and *** = adj. p < 0.001.")}
+knitr::include_graphics(fig_path)
+```
+The plot image was exported to the following file:      
+\footnotesize
+``r paste("", params$subfolder, "alpha_diversity/figures", fig_name, sep = "/")``
+\normalsize
+
+## 3. Statistics calculation and data export
+
+### 3.1 Function for calculating all statistics for all alpha diversity measures
+
+The function `export_data_stats` calculates all statistics and exports the results and (sorted) raw data to an Excel file (via a list). First, the Shapiro test is used to determine the underlying data distribution (normal or non-normal). Subsequently, the following analyses are done:
+
+* Normally distributed data:        
+    - **ANOVA** is used to assess whether overall differences exist in the data
+    - **pairwise** ***t*** **-test** is used to fo all the pairwise comparisons between all factor levels of the variable.
+* Non-normally distributed data:
+    - **Kruskal-Wallis-test** this non-parametric test is used to determine whether there are differences between the groups.
+    - **pairwise Wilcoxon rank sum test** is used to fo all the pairwise comparisons between all factor levels of the variable.
+* An multivariate 'analysis of variance' (**AOV**) is done using the formula supplied in `var_formula`. Significant results suggest at least one mean of the groups differs from the others.
+* The Tukey's HSD (honestly significant difference) test is used as post-hoc test on the AOV results. This test does pairwise comparisons between the means of all groups.
+```{r calc_stats, echo = FALSE}
+## function to export statistics and raw data to Excel
+
+# group_param = "day_arginine"
+# group_formula = "day*arginine"
+# df = alpha_df
+# measure_vars = c("Observed", "Chao1", "ACE", "Shannon", "Simpson", "InvSimpson", "Fisher")
+# p_threshold = 0.05
+# p.adj.method = "fdr"
+# calculate statistics
+tests_summary <- export_data_stats(df = alpha_df)
+```
+
+### 3.2 Export data to Excel
+```{r export_excel, echo = FALSE}
+# export data to Excel
+incProgress(0.1, message = "Saving...")
+file_name <- paste(ifelse(TU_type, "ZOTUs", "OTUs"), var_test, p.adj.method, "alpha.xlsx", sep = ".")
+file_path <- paste(output_dir5, file_name, sep = "/")
+writexl::write_xlsx(tests_summary, path = file_path)
+```
+
+The summarized data was exported to the following Excel file:      
+\footnotesize
+``r paste("", params$subfolder, "alpha_diversity", file_name, sep = "/")``
+\normalsize
+
+## Record session information
+\tiny
+```{r session_info, echo = FALSE}
+print(sessionInfo())
+```

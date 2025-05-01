@@ -1,0 +1,188 @@
+---
+title: "Calculation of alpha diversity"
+author: "`r params$author`"
+date: "`r format(Sys.time(), '%d.%m.%y')`"
+header-includes:
+- \usepackage{float} #use the 'float' package
+- \floatplacement{figure}{H} #make every figure with caption = h
+- \usepackage{flafter}
+- \usepackage{booktabs}
+- \usepackage{longtable}
+- \usepackage{array}
+- \usepackage{multirow}
+- \usepackage{wrapfig}
+- \usepackage{colortbl}
+- \usepackage{pdflscape}
+- \usepackage{tabu}
+- \usepackage{threeparttable}
+- \usepackage{threeparttablex}
+- \usepackage[normalem]{ulem}
+- \usepackage{makecell}
+- \usepackage{xcolor}
+output:
+  pdf_document:
+    latex_engine: lualatex
+    fig_width: 7
+    fig_height: 6
+    fig_caption: yes
+    df_print: kable
+    extra_dependencies: ["float"]
+    includes:
+      in_header: header.tex
+  word_document: default
+  html_document:
+    df_print: kable
+    theme: cerulean
+    highlight: haddock
+    toc: yes
+    toc_depth: 3
+    toc_float: TRUE
+    collapsed: FALSE
+    smooth_scroll: TRUE
+    code_fold: show
+params:
+  author:
+    label: "author of the analysis"
+    value: "no author given"
+  workdir:
+    label: "working directory"
+    value: "U:/00_Shiny/Test"
+  TU_type:
+    label: "type of taxonomic units analyzed"
+    value: "OTU"
+  var_test:
+    label: "x-axix variable for alpha diversity quick plot"
+    value: NULL
+  var_color:
+    label: "color variable for alpha diversity quick plot"
+    value: NULL
+fontsize: 10pt
+urlcolor: blue
+papersize: a4
+---
+```{r version, echo = FALSE}
+script_version <- "1.20"
+#script_date <- file.info("C:\\MyFolder\\test.csv")$mtime
+```
+This is 'Calculation of alpha diversity' script version **`r script_version`** by Dr. Roman Gerlach.
+
+## Load required libraries
+```{r libraries, warning = FALSE, message = FALSE}
+setProgress(0, message = "Loading require libraries...")
+library(tidyverse)
+library(phyloseq)
+library(egg)
+library(rmarkdown)
+library(pander)
+```
+```{r global_options, echo = FALSE}
+# Set up global options for nice reports and keeping figures:
+knitr::opts_chunk$set(fig.width = 7, fig.align = "center", out.extra = "",
+                      warning = FALSE, message = FALSE, fig.pos = "!H",
+                      dev = "cairo_pdf",
+                      cache.path = params$workdir)
+options(knitr.kable.NA = '')
+```
+```{r general_options, echo = FALSE}
+# setting TU type
+TU_type <- ifelse(params$TU_type == "OTU", FALSE, TRUE)
+
+```
+```{r environment, echo = FALSE}
+
+```
+```{r alpha_plot_parameters, echo = FALSE}
+var_test <- params$var_test
+var_color <- params$var_color
+```
+## Setting up environment and script parameters
+Type of imported taxonomic units (TUs)
+`r ifelse(params$TU_type == "OTU", paste0("Taxonomic data is present in the form of **OTUs** (Operational Taxonomic Units)"), paste0("Taxonomic data is present in the form of **ZOTUs/ASVs** (Zero-radius Operational Taxonomic Units/Amplicon Sequence Variants)"))`
+
+Define file paths:
+
+* meta_file: **`r pander::pander(meta_file)`**
+
+Set variables for quick alpha diversity plot (phyloseq function):
+
+* var_test: **`r pander::pander(var_test)`**
+* var_color: **`r pander::pander(var_color)`**
+
+\newpage
+## Calculate (phyloseq) alpha diversity
+```{r calc_import_alpha}
+setProgress(0.3, message = "Calculating alpha diversities...")
+Sys.sleep(1)
+set.seed(42)
+# read list of Physeq objects to workspace
+physeq_list <- readRDS(ifelse(TU_type, input$uploadZOTUphyseq$datapath, input$uploadOTUphyseq$datapath))
+
+# Define Alpha diversity measures to be calculated: "Observed", "Chao1",
+# "ACE", "Shannon", "Simpson", "InvSimpson", "Fisher"
+meas <- c("Observed", "Chao1", "ACE", "Shannon", "Simpson", "InvSimpson")
+
+# import metadata from physeq list (filter meta according to unfiltered PhyloSeq object is redundant?)
+phyloseq_meta <- phyloseq::sample_data(physeq_list[["ori_no_ctrls"]]) #%>%
+  # install speedyseq first!
+  # rename_sample_data(sample_ID = sample)
+
+# function to calculate Alpha diversity from phyloseq object
+# merge with metadata
+alpha_add_meta <- function(x, measure = meas) {
+  # import and transform data
+    # this is where alpha diversity is calculated
+    ad <- phyloseq::estimate_richness(x, measures = measure) %>%
+      tibble::rownames_to_column(var = "sample_ID") %>%
+      dplyr::select(-starts_with("se")) %>%
+      dplyr::left_join(phyloseq_meta, by = "sample_ID") %>%
+      tidyr::pivot_longer(all_of(meas), names_to = "measure") %>%
+      # remove NA --> check which samples!
+      dplyr::filter(!is.na(value)) 
+
+  # convert "NaN" to NA if present
+  if(is.character(ad$value)) {
+    ad <- dplyr::mutate(ad, value = na_if(value, "NaN"))
+  }
+  # remove unused factor levels
+  ad <- ad %>%
+    droplevels()
+}
+```
+\newpage
+## Plot alpha diversity
+```{r alpha_plot, , echo = FALSE, fig.cap = "Different alpha diversity metrics before (A) and after (B) sample filtering"}
+## calculate and plot alpha diversity from original and sample-filtered ('no out samples') phyloseq object
+setProgress(0.6, message = "Quick plotting alpha diversities...")
+alpha_plot_list <- setNames(vector("list", 2), c("original", "no_out"))
+alpha_plot_list[["original"]] <- phyloseq::plot_richness(physeq_list[["ori_no_ctrls"]], x = var_test, color = var_color, measures = meas)
+alpha_plot_list[["no_out"]] <- phyloseq::plot_richness(physeq_list[["no_ctrls"]], x = var_test, color = var_color, measures = meas)
+alpha_plot_list <- lapply(alpha_plot_list,
+            function(x) {x + egg::theme_article() + ggplot2::theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))})
+
+# Combine each plot into one graphic.
+alpha_plots <- egg::ggarrange(plots = alpha_plot_list, nrow = 2, labels = c("A", "B"),
+               label.args = list(gp = grid::gpar(cex = 1.5, face = "bold")))
+```
+## Export alpha diversity data as list in RDS format
+```{r export_phyloseq}
+# generate empty list to store different alpha diversity measures
+alpha_list <- setNames(vector("list", 2), c("original", "no_out"))
+
+# calculate alpha diversity, combine with metadata and save to list
+alpha_list[["original"]] <- alpha_add_meta(physeq_list[["ori_no_ctrls"]])
+alpha_list[["no_out"]] <- alpha_add_meta(physeq_list[["filt_no_ctrls"]])
+
+# save list of all alpha diversity data to file
+setProgress(0.9, message = "Saving...")
+saveRDS(alpha_list, file = paste0(
+  output_dir2, "/alpha_list_", ifelse(TU_type, "zotu", "otu"), ".rds"))
+
+```
+
+\newpage
+## Record session information
+\tiny
+```{r session_info, echo = FALSE}
+# https://stackoverflow.com/questions/25646333/code-chunk-font-size-in-rmarkdown-with-knitr-and-latex
+print(sessionInfo())
+```

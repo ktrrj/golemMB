@@ -1,0 +1,735 @@
+---
+title: "Functional abundance analysis"
+author: "`r params$author`"
+date: "`r format(Sys.time(), '%d.%m.%y')`"
+header-includes:
+- \usepackage{float} #use the 'float' package
+- \floatplacement{figure}{H} #make every figure with caption = h
+- \usepackage{flafter}
+- \usepackage{booktabs}
+- \usepackage{longtable}
+- \usepackage{array}
+- \usepackage{multirow}
+- \usepackage{wrapfig}
+- \usepackage{colortbl}
+- \usepackage{pdflscape}
+- \usepackage{tabu}
+- \usepackage{threeparttable}
+- \usepackage{threeparttablex}
+- \usepackage[normalem]{ulem}
+- \usepackage{makecell}
+- \usepackage{xcolor}
+output:
+  pdf_document:
+    latex_engine: lualatex
+    fig_width: 7.5
+    fig_height: 10
+    fig_caption: yes
+    df_print: kable
+    extra_dependencies: ["float"]
+    includes:
+      in_header: header.tex
+  word_document: default
+  html_document:
+    df_print: kable
+    theme: cerulean
+    highlight: haddock
+    toc: yes
+    toc_depth: 3
+    toc_float: TRUE
+    collapsed: FALSE
+    smooth_scroll: TRUE
+    code_fold: show
+params:
+  author:
+    label: "author of the analysis"
+    value: "no author given"
+  workdir:
+    label: "working directory"
+    value: "U:/00_Shiny/Test"
+  subfolder:
+    label: "subdirectory"
+    value: !r format(Sys.time(), '%y%m%d')
+  useMC:
+    label: "whether to use multicore processing or number of processors"
+    value: TRUE
+  var_test:
+    label: "metadata variable to analyze"
+    value: NULL
+  comp_list:
+    label: "list of factor levels to compare"
+    value: !r NULL
+  seed:
+    label: "set seed value"
+    value: 42 
+  cutoff_pval:
+    label: "cutoff for (adj.) p value"
+    value: 0.05
+  cutoff_aldex:
+    label: "cutoff for minimum effect size in aldex"
+    value: 1
+fontsize: 10pt
+urlcolor: blue
+papersize: a4
+editor_options: 
+  chunk_output_type: console
+---
+```{r version, echo = FALSE}
+script_version <- "1.50"
+#script_date <- file.info("C:\\MyFolder\\test.csv")$mtime
+```
+This is 'Functional abundance analysis' script version **`r script_version`** by Dr. Roman Gerlach. The general approach was adopted from [here](https://ycl6.github.io/16S-Demo/4_picrust2_tutorial.html). Running this script under Linux gives a significant speed advantage because of the more efficient multicore support with the use of the `mclapply` function versus the `parLapply` alternative applied under Windows.
+
+### Load required libraries
+```{r libraries, echo = TRUE, results = 'hide', warning = FALSE, message = FALSE}
+setProgress(1/8, message = "Loading required packages...")
+library(tidyverse)
+library(phyloseq)
+library(data.table)
+library(parallel)
+library(ALDEx2)
+library(ggraph)
+library(ggforce)
+library(ggtext)
+library(egg)
+library(pander)
+library(kableExtra)
+```
+```{r global_options, echo = FALSE}
+# set directories
+workdir <- params$workdir
+subdir <- params$subfolder
+
+# Set up global options for nice reports and keeping figures:
+current_dir <- paste(workdir, subdir, sep = "/")
+knitr::opts_chunk$set(fig.width = 7.5, fig.align = "center", out.extra = "",
+                      warning = FALSE, message = FALSE, fig.pos = "!H",
+                      cache.path = current_dir,
+                      dev = "cairo_pdf")
+options(knitr.kable.NA = '')
+
+# check and create directory structure
+# if(!dir.exists(paste0(current_dir, "/FA_analysis"))) {dir.create(paste0(current_dir, "/FA_analysis"))}
+# if(!dir.exists(paste0(current_dir, "/FA_analysis/data"))) {dir.create(paste0(current_dir, "/FA_analysis/data"))}
+# if(!dir.exists(paste0(current_dir, "/FA_analysis/figures"))) {dir.create(paste0(current_dir, "/FA_analysis/figures"))}
+```
+## 1. Setting up environment and script parameters
+
+Import the following list containing the phyloseq objects:
+
+\footnotesize `r input$uploadZOTUphyseq$datapath` \normalsize
+
+-   Variable to test = **`r params$var_test`**
+
+### 1.1 Define contrasts
+Two group comparisons are defined by a list of character vectors of length two. The order determines the direction of comparison. The first element is the numerator for the fold change. The second element is used to specify the reference group (control) and therefore defines the baseline (denominator for fold change).\
+The following factor levels of variable **`r params$var_test`** are compared: `r pander::pander(params$comp_list)`
+
+```{r environment, echo = FALSE}
+seed <- params$seed
+set.seed(seed)
+# https://stackoverflow.com/questions/34029611/how-to-use-objects-from-global-environment-in-rstudio-markdown
+# source functions for import
+# source("../helper_functions/functions_import.R", local = knitr::knit_global())
+
+# source functions for plotting
+# source("../helper_functions/functions_plotting.R", local = knitr::knit_global())
+
+# source accessory functions, e.g. for working with phyloseq objects
+# source("../helper_functions/functions_accessory.R", local = knitr::knit_global())
+
+# Import PICRUSt2 map files list
+picrust2.map <- readRDS(system.file("PICRUSt2", "picrust2.map.rds", package = "golemMB"))
+
+# Import MetaCyc pathway hierarchy map
+load(system.file("PICRUSt2", "MetaCyc_pathway_map.RData", package = "golemMB"))
+
+# use multicore processing
+useMC <- params$useMC
+
+# variable to analyze
+var_test <- params$var_test
+
+# import list of phyloseq objects
+physeq.list <- readRDS(input$uploadZOTUphyseq$datapath)
+# import phyloseq object
+ps <- physeq.list[["no_ambig_euk"]]
+# extract metadata from ps
+meta <- as_tibble(phyloseq::sample_data(ps))
+
+# import comparison list
+comp <- params$comp_list
+# apply names to comparison list
+names(comp) <- sapply(comp, paste, collapse = "_vs_")
+# calculate number of cores to use depending on 'useMC' option and OS
+useMC <- params$useMC
+# maximum number of cores available
+max_cores <- parallel::detectCores(logical = TRUE)
+if(is.logical(useMC)) {
+  if(useMC) {
+    if(.Platform$OS.type == "windows") {
+      # adjust number of clusters depending on number of comparisons
+      # this is mainly to save memory due to unused, but initiated clusters
+      num_cores <- if(length(comp) <= max_cores) {
+        length(comp)} else if(length(comp)/2 <= max_cores) {
+          ceiling(length(comp)/2)} else max_cores-1
+    } else {
+      num_cores <- max_cores-1
+    }
+  }
+} else if(is.numeric(useMC)) {
+  num_cores <- ifelse(useMC < max_cores, useMC, max_cores-1)
+  useMC <- ifelse(useMC > 1, TRUE, FALSE)
+} else stop("variable 'useMC' should be either logical or numeric")
+
+```
+A function is used to check whether the list with comparisons is valid:
+
+`r pander::pander(check_comp_list(comp))`
+
+### 1.2 Parameters of functional abundance (FA) analyses
+
+The following parameters were used for functional abundance (FA) analyses:
+
+* cutoff for (adj.) p value (cutoff_pval) = **`r params$cutoff_pval`**
+* cutoff for minimum effect size in ALDEx2 (cutoff_aldex) = **`r params$cutoff_aldex`** The ALDEx2 authors suggest that an effect size of 1 or greater can be used as significance cutoff.
+
+`r if(useMC) {paste("The FA analyses are done in parallel mode using", num_cores, "CPUs.")} else {paste("The FA analyses are done in serial mode (no multiprocessing).")}`
+```{r analysis_parameters, echo = FALSE}
+cutoff_pval <- params$cutoff_pval
+padj_method <- params$padj_method
+cutoff_aldex <- params$cutoff_aldex
+```
+```{r analysis_parameters_debug, echo = FALSE, eval = FALSE}
+# variable to analyze
+var_test <- "condition"
+
+useMC <- TRUE
+
+workdir <- ""
+subdir <- paste(format(Sys.time(), '%y%m%d'), var_test, sep = "_")
+
+# seed
+seed <- 42
+
+# # source functions to fix plot sizes
+# source("../helper_functions/resize_ggplot2_panels.R", local = knitr::knit_global())
+# 
+# # source functions for data import / conversion
+# source("../helper_functions/functions_import.R", local = knitr::knit_global())
+# 
+# # source functions for plotting
+# source("../helper_functions/functions_plotting.R", local = knitr::knit_global())
+# 
+# # source accessory functions, e.g. for working with phyloseq objects
+# source("../helper_functions/functions_accessory.R", local = knitr::knit_global())
+# 
+# # Import PICRUSt2 map files list
+# picrust2.map <- readRDS(file = "../PICRUSt2/picrust2.map.rds")
+# 
+# # Import MetaCyc pathway hierarchy
+# load(file = "/PICRUSt2/MetaCyc_pathway_map.RData")
+# 
+# # import list of phyloseq objects
+# physeq.list <- readRDS(file = paste0(workdir,"/physeq_list.rds"))
+# # import phyloseq object
+# ps <- physeq.list[["no_ambig_phyl"]]
+# # extract metadata from ps
+# meta <- as_tibble(phyloseq::sample_data(ps))
+
+# import comparison list
+comp <- list(
+  c("diet", "reference"),
+  c("DSS", "reference"),
+  c("DSS", "diet")
+)
+# apply names to comparison list
+names(comp) <- sapply(comp, paste, collapse = "_vs_")
+
+cutoff_pval <- 0.05
+cutoff_aldex <- 1
+```
+\newpage
+## 2. PICRUSt2 analysis
+PICRUSt 2.0 (**P**hylogenetic **I**nvestigation of **C**ommunities by **R**econstruction of **U**nobserved **St**ates) is a software for predicting functional abundances based only on marker gene sequences. The corresponding manuscript is available [here](https://www.nature.com/articles/s41587-020-0548-6). At [this](https://huttenhower.sph.harvard.edu/picrust/) website, a comprehensive description and manual is available for PICRUSt 2.0.
+
+### 2.1 Run PICRUSt2
+PICRUSt2 is a Python-based tool which was installed in a `mamba` environment using the following script:
+```{bash, eval = FALSE}
+#Installation: run all only once!!
+#install picrust in conda environment "picrust2"
+conda install conda-build
+conda install -c conda-forge mamba
+conda update conda-build
+mamba init
+mamba create -n picrust2 -c bioconda -c conda-forge picrust2=2.5.0
+```
+The R script `01_phyloseq_import_zotu_param.Rmd` was used to decontaminate 16S ZOTU (ASV) sequences and export the corresponding fasta file `ZOTUs_Seqs_noctrls_decontam.fasta` and biom file `expr_noctrls_decontam.biom` which are used as inputs for PICRUSt2:
+```{bash, eval = FALSE}
+#activate picrust2 environment
+mamba activate picrust2
+#from within the directory containing the two input files execute the Python
+#script, adjust number of processes according to available CPU cores
+picrust2_pipeline.py --study_fasta ./ZOTUs_Seqs_noctrls_decontam.fasta \
+--input ./expr_noctrls_decontam.biom --output picrust2_out_stratified \
+--in_traits EC,KO,COG,PFAM,TIGRFAM --processes 14 --stratified \
+--min_reads 10 --min_samples 3 \
+--remove_intermediate --verbose &> picrust2.stats.txt
+```
+With this script functional abundances (FA) for the following gene families/features are predicted:
+
+-   **EC** enzymes based on their Enzyme Commission (EC) number
+-   **KO** Molecular functions as listed in the **K**EGG **O**rthology [database](https://www.genome.jp/kegg/ko.html)
+-   **COG** [Database](https://www.ncbi.nlm.nih.gov/research/cog) of **C**lusters of **O**rthologous **G**enes (COGs)
+-   **PFAM** [Database](https://www.ebi.ac.uk/interpro/search/sequence/) of **P**rotein **Fam**ilies
+-   **TIGRFAM** TIGRFAMs is a database of protein **fam**ily definitions. The original TIGRFAMs database was a research project of The Institute for Genomic Research (**TIGR**) and its successor, the J. Craig Venter Institute (JCVI). The TIGRFAMs database is now available through [NCBI](https://www.ncbi.nlm.nih.gov/protfam/?term=TIGRFAM%5BFilter%5D).
+-   **PW** [MetaCyc](https://metacyc.org/) reactions are inferred from enzymes (EC) and then, by default, mapped to prokaryotic metabolic pathways
+
+\newpage
+
+### 2.2 Import PICRUSt2 results
+The following script imports the PICRUSt2 results from the (standard) subdirectory `picrust2_out_stratified` of the working directory `r workdir` and saves the formatted output as a list where each element corresponds to a feature set analyzed.
+```{r import_picrust}
+incProgress(1/7, message = "Importing PICRUSt2 results...")
+# name of picrust2 results file
+pc2_results_file <- paste0(output_dir9, "/picrust2.output.rds")
+
+# if(!file.exists(pc2_results_file)) {
+  # function to built file paths
+  pc2_filepaths <- function(x) {
+    if(x != "pathways"){
+      paste0(zip_dir, "/picrust2_out_stratified/", x, "_out/",
+             "pred_metagenome_unstrat.tsv.gz")
+    } else {
+      paste0(zip_dir, "/picrust2_out_stratified/", x, "_out/",
+             "path_abun_unstrat.tsv.gz")
+    }
+  }
+  # generate PICRUSt2 results file paths 
+  pc2_files <- lapply(list("COG_metagenome", "EC_metagenome", "KO_metagenome",
+                      "pathways", "PFAM_metagenome", "TIGRFAM_metagenome"),
+                      pc2_filepaths)
+
+  # function to import data
+  pc2_import <- function(x) {
+    y <- base::as.data.frame(data.table::fread(x))
+    if(str_detect(x, "pathways")) {
+      base::rownames(y) <- y$"pathway"
+    } else base::rownames(y) <- y$"function"
+    y <- base::as.matrix(y[,-1])
+    y <- base::round(y)
+  }
+  
+  # import data as a list
+  picrust2.out <- setNames(lapply(pc2_files, pc2_import),
+                          c("p2COG", "p2EC", "p2KO", "p2PW", "p2PFAM", "p2TIGRFAM")) 
+  
+  # export results list
+  saveRDS(picrust2.out, file = pc2_results_file)
+# } else picrust2.out <- readRDS(pc2_results_file)
+```
+\newpage
+## 3. Differential functional abundance (FA) analyses with ALDEx2
+
+ALDEx2 uses probabilisitic modelling and compositional data analysis to analyze differential (relative) abundances. ALDEx2 uses the centered log-ratio (CLR) transformation (or closely related log-ratio transforms) which ensures the data are scale invariant and sub-compositionally coherent ([Aitchison, 1982](https://doi.org/10.1111/j.2517-6161.1982.tb01195.x)). The scale invariance property removes the need for a between sample data normalization step since the data are all placed on a consistent numerical co-ordinate. The sub-compositional coherence property ensures that the answers obtained are consistent when parts of the dataset are removed (e.g., removal of rRNA reads from RNA-seq studies or rare OTU species from 16S rRNA gene amplicon studies). All feature abundance values are expressed relative to the geometric mean abundance of other features in a sample. This is conceptually similar to a quantitative PCR where abundances are expressed relative to a standard: in the case of the CLR transformation, the standard is the per-sample geometric mean abundance. See [Aitchison (1982)]((https://doi.org/10.1111/j.2517-6161.1982.tb01195.x)) for a complete description.
+
+ALDEx2 citation: Fernandes, AD, Reid, JNS *et al*. 2014. Unifying the Analysis of High-Throughput Sequencing Datasets: Characterizing Rna-Seq, 16S rRNA Gene Sequencing and Selective Growth Experiments by Compositional Data Analysis. Genome Biology 15(2): 1--17. doi: [10.1186/2049-2618-2-15](https://doi.org/10.1186/2049-2618-2-15)
+
+### 3.1 Function for ALDEx2 analyes
+The function `aldex2_contrast` applies ALDEx2 differential analysis to PICRUSt2-derived feature counts of one comparison.
+
+```{r ax2_function, echo = TRUE}
+incProgress(1/7, message = "Calculating differential functional abundace...")
+# function to calculate ALDEx2 for single contrast (x)
+aldex2_contrast <- function(x, mc.samples) {
+ 
+  # function to further format time difference
+  ax2_difft <- function(calc, start.t = s) {
+    x <- format_difftime(first = start.t, second = Sys.time())
+    return(paste0("ALDEx2 for ", calc, " done in: **", x, "**"))
+  }
+
+  # list to store results
+  res.list <- setNames(
+      vector("list", 6),
+      c("COG", "EC", "KO", "PW", "PFAM", "TIGRFAM")
+    )
+  stat.list <- res.list
+  # subset data for pairwise comparisons
+  meta <- dplyr::filter(meta, base::get(var_test) %in% x)
+  
+  # modify factor levels to define reference condition
+  meta[, var_test] <- droplevels(meta[, var_test])
+  meta[, var_test] <- fct_relevel(pull(meta[, var_test]), rev(x))
+  
+  # subset data
+  p2COG     <- picrust2.out[["p2COG"]][, meta$sample_ID]
+  p2EC      <- picrust2.out[["p2EC"]][, meta$sample_ID]
+  p2KO      <- picrust2.out[["p2KO"]][, meta$sample_ID]
+  p2PW      <- picrust2.out[["p2PW"]][, meta$sample_ID]
+  p2PFAM    <- picrust2.out[["p2PFAM"]][, meta$sample_ID]
+  p2TIGRFAM <- picrust2.out[["p2TIGRFAM"]][, meta$sample_ID]
+  
+  ## ALdex2 analysis
+  # COG
+  s <- Sys.time()
+  res.list[["COG"]] <-
+    aldex(p2COG, pull(meta[, var_test]), mc.samples = mc.samples, test = "t",
+          effect = TRUE, denom = "iqlr", verbose = TRUE)
+  stat.list[["COG"]] <- ax2_difft("COG")
+  res.list[["COG"]] <- res.list[["COG"]] %>%
+    tibble::rownames_to_column(var = "COG") %>%
+    dplyr::inner_join(picrust2.map[["mapCOG"]], by = c("COG" = "function")) %>%
+    dplyr::arrange(desc(abs(effect)))
+  
+  ## EC
+  s <- Sys.time()
+  res.list[["EC"]] <-
+    aldex(p2EC, pull(meta[, var_test]), mc.samples = mc.samples, test = "t",
+                      effect = TRUE, denom = "iqlr", verbose = TRUE)
+  stat.list[["EC"]] <- ax2_difft("EC")
+  res.list[["EC"]] <- res.list[["EC"]] %>%
+    tibble::rownames_to_column(var = "EC") %>%
+    dplyr::inner_join(picrust2.map[["mapEC"]], by = c("EC" = "function")) %>%
+    dplyr::arrange(desc(abs(effect)))
+
+  ## KO
+  s <- Sys.time()
+  res.list[["KO"]] <-
+    aldex(p2KO, pull(meta[, var_test]), mc.samples = mc.samples, test = "t",
+                       effect = TRUE, denom = "iqlr", verbose = TRUE)
+  stat.list[["KO"]] <- ax2_difft("KO")
+  # join with KO mapping data
+  res.list[["KO"]] <- res.list[["KO"]] %>%
+    tibble::rownames_to_column(var = "KO") %>%
+    dplyr::inner_join(picrust2.map[["mapKO"]], by = c("KO" = "function")) %>%
+    dplyr::arrange(desc(abs(effect)))
+
+  ## Pathway
+  s <- Sys.time()
+  res.list[["PW"]] <-
+    aldex(p2PW, pull(meta[, var_test]), mc.samples = mc.samples, test = "t", 
+                       effect = TRUE, denom = "iqlr", verbose = TRUE)
+  stat.list[["PW"]] <- ax2_difft("PW")
+  # join with pathway mapping data
+  res.list[["PW"]] <- res.list[["PW"]] %>%
+    tibble::rownames_to_column(var = "PW") %>% 
+    dplyr::inner_join(picrust2.map[["mapPW"]], by = c("PW" = "pathway")) %>%
+    dplyr::arrange(desc(abs(effect)))
+  
+  ## PFAM
+  s <- Sys.time()
+  res.list[["PFAM"]] <-
+    aldex(p2PFAM, pull(meta[, var_test]), mc.samples = mc.samples, test = "t",
+          effect = TRUE, denom = "iqlr", verbose = TRUE)
+  stat.list[["PFAM"]] <- ax2_difft("PFAM")
+  res.list[["PFAM"]] <- res.list[["PFAM"]] %>%
+    tibble::rownames_to_column(var = "PFAM") %>%
+    dplyr::inner_join(picrust2.map[["mapPFAM"]], by = c("PFAM" = "function")) %>%
+    arrange(desc(abs(effect)))
+  
+  ## TIGRFAM
+  s <- Sys.time()
+  res.list[["TIGRFAM"]] <-
+    aldex(p2TIGRFAM, pull(meta[, var_test]), mc.samples = mc.samples, test = "t",
+          effect = TRUE, denom = "iqlr", verbose = TRUE)
+  stat.list[["TIGRFAM"]] <- ax2_difft("TIGRFAM")
+  res.list[["TIGRFAM"]] <- res.list[["TIGRFAM"]] %>%
+    tibble::rownames_to_column(var = "TIGRFAM") %>%
+    dplyr::inner_join(picrust2.map[["mapTIGRFAM"]], by = c("TIGRFAM" = "function")) %>%
+    arrange(desc(abs(effect)))
+    
+# names(stat.list) <- str_replace(names(stat.list), "_vs_", " vs. ")
+return(list(data = res.list, stat = stat.list))
+}
+
+
+
+```
+### 3.2 Running times of ALDEx2 analyses
+Parallel processing of individual comparisons using multicore-enabled `mclapply` (Linux etc.) or `parLapply` (Windows) functions.
+
+```{r run_ax2}
+# function to format total time difference
+total_ax2_difft <- function(calc, start.t = st) {
+  x <- format_difftime(first = start.t, second = Sys.time())
+  return(paste0("All ALDEx2 analyses were done in **", x, "** using ", calc))
+}
+
+# name of aldex2 results file
+ax2_results_file <- paste0(output_dir9,
+                           paste0("/ALDEx2_picrust2_", var_test, ".rds"))
+# do ALDEx2 analyses using parallel processing
+if(!file.exists(ax2_results_file)) {
+  if(useMC) {
+    # run the analysis in parallel using different functions depending on the OS 
+    if(.Platform$OS.type == "windows") {
+      st <- Sys.time()
+      # initiate clusters
+      cl <- parallel::makeCluster(num_cores, type = "PSOCK")
+      # everything created before starting clusters has to be exported
+      # export required libraries to the env of each cluster
+      parallel::clusterEvalQ(cl, c(library(forcats), library(dplyr),
+                                   library(tibble), library(ALDEx2)))
+      # export required objects to the env of each cluster
+      parallel::clusterExport(cl, c("meta", "var_test", "picrust2.out",
+                                    "picrust2.map", "format_difftime"),
+                              envir = environment())
+      ax2.results <- parallel::parLapply(cl = cl, X = comp, fun = aldex2_contrast,
+                                         mc.samples = 500) #, chunk.size = 1
+      stopCluster(cl)
+      attr(ax2.results, "total_runtime") <- total_ax2_difft("parLapply (parallel).")
+    } else {
+      # if on Linux / MacOS: use the more efficient 'mclapply'
+      st <- Sys.time()
+      ax2.results <- parallel::mclapply(comp, aldex2_contrast, mc.samples = 500,
+                                        mc.cores = num_cores)
+      attr(ax2.results, "total_runtime") <- total_ax2_difft("mclapply (parallel).")
+    }
+  } else {
+    # use serial mode (no multicore)
+    st <- Sys.time()
+    ax2.results <- lapply(comp, aldex2_contrast, mc.samples = 500)
+    attr(ax2.results, "total_runtime") <- total_ax2_difft("lapply (serial).")
+  }
+  # export results as RDS file
+  saveRDS(ax2.results, file = ax2_results_file)
+} else {
+  ax2.res.present <- paste0("Results file: 'ALDEx2_picrust2_", var_test,
+                            ".rds' already present! Skip ALDeX2 analyses.")
+  ax2.results <- readRDS(ax2_results_file)
+}
+
+# function to extract running times from results list
+extract.stats <- function(x) {
+  # prepare list
+  stat.list <- setNames(vector("list", length(x)), names(x))
+  for(i in names(x)) {
+    for(j in 1:6) {
+     stat.list[[i]][[j]] <- x[[i]][["stat"]][[j]] 
+    }
+  }
+  names(stat.list) <- stringr::str_replace(names(stat.list), "_vs_", " vs. ")
+  return(stat.list)
+}
+```
+### 3.2 Running times of ALDEx2 analyes
+`r if(exists("ax2.res.present")) ax2.res.present` The ALDEx2 running times of the individual comparisons are shown below: 
+
+`r pander::pander(extract.stats(ax2.results))`
+
+`r attr(ax2.results, "total_runtime")`
+
+### 3.3 Export ALDEx2 results
+```{r export_ax2, echo = FALSE}
+# function for Excel export
+export_Excel <- function(x) {
+  file_list <- list()
+  file_list[[1]] <- paste0("ALDEx2_picrust2_", var_test, ".rds")
+  features <- c("COG", "EC", "KO", "PW", "PFAM", "TIGRFAM")
+  for(i in 1:length(features)) {
+    # make a list list
+    store <- setNames(vector("list", length(comp)), names(comp))
+    for (j in names(store)) {
+      store[[j]] <- x[[j]][["data"]][[features[i]]]
+    }
+    Excel_file <- paste0("ALDEx2_picrust2_", var_test, "_", features[i], ".xlsx")
+    writexl::write_xlsx(store, path = paste(output_dir9,
+                                            Excel_file, sep = "/"))
+    file_list[[i+1]] <- Excel_file
+  }
+  return(file_list)
+}
+
+# export data to Excel
+exported_files <- export_Excel(ax2.results)
+```
+Data has been exportet to the following files within the subdirectory ``r subdir``:
+
+`r pander::pander(exported_files)`
+
+The `rds` and Excel files contain the ALDEx2 results output with the following variables:
+
+-   rab.all - median CLR value for all samples in the feature
+-   rab.win.NS - median CLR value for the NS group of samples
+-   rab.win.S - median CLR value for the S group of samples
+-   diff.btw - median difference in CLR values between S and NS groups
+-   diff.win - median of the largest difference in CLR values within S and NS groups
+-   effect - median effect size: diff.btw / max(diff.win) for all instances
+-   overlap - proportion of effect size that overlaps 0 (i.e. no effect)
+-   we.ep - Expected P value of Welch's t test
+-   we.eBH - Expected Benjamini-Hochberg corrected P value of Welch's t test
+-   wi.ep - Expected P value of Wilcoxon rank test
+-   wi.eBH - Expected Benjamini-Hochberg corrected P value of Wilcoxon test
+
+A detailed overview about these parameters can be found in the [ALDEx2 vignette](https://www.bioconductor.org/packages/devel/bioc/vignettes/ALDEx2/inst/doc/ALDEx2_vignette.html#52_Explaining_the_outputs).
+
+\newpage
+## 4. Statistical overviews of MetaCyc pathways results
+Overview plots of the results and statistics of the ALDEx2 MetaCyc pathway analyses are generated. Therefore, the plotting functions built in the `ALDEx2` package were re-written using `ggplot2`. 
+
+### 4.1 Histograms of estimated effect sizes
+```{r fig_data, echo = FALSE}
+incProgress(1/7, message = "Combining pathways...")
+# combine all pathway data in one df for (faceted) plotting
+bind_ax2_pw <- dplyr::bind_rows(
+  purrr::map(names(ax2.results),
+             \(x) ax2.results[[x]][["data"]][["PW"]] %>%
+               mutate(
+                 ref = stringr::str_remove(names(.)[3], "rab\\.win\\."),
+                 test = stringr::str_remove(names(.)[4], "rab\\.win\\.")
+               ) %>%
+               dplyr::rename(rab.win.ref = 3, rab.win.test = 4)),
+  .id = "comparison") %>%
+  mutate(comparison = as.numeric(comparison),
+         comparison = names(ax2.results)[comparison],
+         comparison = str_replace(comparison, "_vs_", " vs. "))
+# calculate plot height depending on number of comparisons
+# https://stackoverflow.com/questions/15365829/dynamic-height-and-width-for-knitr-plots/47339394
+# https://www.tidyverse.org/blog/2020/08/taking-control-of-plot-scaling/
+fig.height.calc <- function(x) {
+  cols <- if(length(x) < 3) 2 else if(length(x) < 16) 3 else 4
+  rows <- ceiling(length(x)/cols)
+  return(2.4*rows)
+}
+fig_height <- fig.height.calc(comp)
+```
+```{r fig_hist, echo = FALSE, out.width = "100%", fig.width = 7.5, fig.height = fig_height*0.9, fig.cap = paste0("Frequency of the ALDEx2 effect sizes in the comparisons indicated. The grey dashed lines represent the margins of a significant effect size of ", cutoff_aldex, ".")}
+hist.aldex.plot(bind_ax2_pw)
+```
+### 4.2 Fold-change to variance/effect (MW) plots
+```{r fig_mw, echo = FALSE, out.width = "100%", fig.width = 7.5, fig.height = fig_height, fig.cap = paste0("MW plots depict the relation between the fold-change ('diff.btw') and variance ('diff.win') for the comparisons indicated. The grey vertical dashed lines represent the margins where within and between group variation is equivalent. Red dots show pathways with with false discovery rate, q <= ", cutoff_pval, " of Welch's t test and an effect size of >= ", cutoff_aldex, ". Blue dots represent 'rare' pathways with median CLR value for all samples in the feature ('rab.all') < 0. All other (non-significant, non-rare) pathways are shown as black dots.")}
+aldex.plot2(bind_ax2_pw, type = "MW")
+```
+### 4.3 Bland-Altman (MA) plots
+```{r fig_ma, echo = FALSE, out.width = "100%", fig.width = 7.5, fig.height = fig_height, fig.cap = paste0("Bland-Altman plots showing the relation between the fold-change ('diff.btw') and median log2 relative abundance ('rab.all') for the comparisons indicated. Red dots show pathways with with false discovery rate, q <= ", cutoff_pval, " of Welch's t test and an effect size of >= ", cutoff_aldex, ". Blue dots represent 'rare' pathways with median CLR value for all samples in the feature ('rab.all') < 0. All other (non-significant, non-rare) pathways are shown as black dots.")}
+aldex.plot2(bind_ax2_pw, type = "MA")
+```
+### 4.4 Effect size plots
+```{r fig_eff, echo = FALSE, out.width = "100%", fig.width = 7.5, fig.height = fig_height, fig.cap = paste0("Effect size plots showing the relation between the effect size and and the p-values of Welch's t test for the comparisons indicated. The grey dashed lines represent the margins of a significant effect size of ", cutoff_aldex, ". The horizontal orange dashed line represents the p-value threshold of ", cutoff_pval, ". While blue dots represent uncorrected p-values, red dots show the Benjamini-Hochberg corrected p-values of Welch's t test.")}
+effect.volcano.plot(bind_ax2_pw, type = "EFF")
+```
+### 4.5 Volcano plots
+```{r fig_volc, echo = FALSE, out.width = "100%", fig.width = 7.5, fig.height = fig_height, fig.cap = paste0("Volcano plots showing the relation between the median difference in CLR values of the two groups and the p-values of Welch's t test for the comparisons indicated. The horizontal orange dashed line represents the p-value threshold of ", cutoff_pval, ". While blue dots represent uncorrected p-values, red dots show the Benjamini-Hochberg corrected p-values of Welch's t test.")}
+effect.volcano.plot(bind_ax2_pw, type = "VOLC")
+```
+\newpage
+## 5. Hierarchical data visualization
+MetaCyc pathways are [hierarchically organized](https://metacyc.org/META/class-tree?object=Pathways) based on functional similarity. The MetaCyc pathway hierarchy data was imported from [here](https://github.com/ChiLiubio/file2meco/blob/master/data/MetaCyc_pathway_map.RData).
+
+### 5.1 Import data as igraph object
+The results of the ALDEx2 analysis and the MetaCyc pathway hierarchy are combined in an [`igraph`](https://igraph.org/r/html/latest/aaa-igraph-package.html) object. `Igraph` is a R package for network analysis. 
+```{r igraphs}
+# function to rearrange ALDEx2 results
+rearrange_ax2_results <- function(x) {
+  res.list <- setNames(vector("list", length(x)), names(x))
+  for(i in names(x)) {
+   res.list[[i]] <- x[[i]][["data"]] 
+  }
+  return(res.list)
+}
+# import pathway data as igraph object
+
+ax2_igraphs <- import_aldex2_igraph(ax2_list = rearrange_ax2_results(ax2.results),
+                                    pw_hierarchy = MetaCyc_pathway_map,
+                                    min_eff_size = cutoff_aldex,
+                                    max_adj_p = cutoff_pval)
+```
+### 5.2 Import data as metacoder environment
+In an alternative approach, the results of the ALDEx2 analysis and the MetaCyc pathway hierarchy are combined in a [`metacoder`](https://grunwaldlab.github.io/metacoder_documentation/index.html) environment. `Metacoder` is a R package that provides a tree-based visualization called 'heat trees' used to depict statistics for hierarchical data using color and size. See [this manuscript](https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1005404) for more information.
+```{r import_metacoder}
+# import pathway data as metacoder environment
+ax2_meta <- import_aldex2_metacoder(ax2_list = rearrange_ax2_results(ax2.results),
+                                    pw_hierarchy = MetaCyc_pathway_map,
+                                    min_eff_size = cutoff_aldex,
+                                    max_adj_p = cutoff_pval)
+# check whether missing combinations of comparison / pathway had to be completed
+if(!is.null(ax2_meta)) {
+  if(!is.null(attr(metacoder:::get_taxmap_table(ax2_meta, "diff_table"), "completed"))) {
+    compl_comps <- attr(metacoder:::get_taxmap_table(ax2_meta, "diff_table"), "completed") 
+  }
+}
+```
+`r if (exists("compl_comps")) paste("The following missing combinations of contrast and pathway have been completed with non-significant data (effect = 0, adj.p = 1) to obtain a dataset compatible with metacoder.")`
+```{r completed_data, eval = exists("compl_comps"), echo = FALSE}
+ kbl(compl_comps, caption = paste("Completed 'missing' contrast/pathway combinations for metacoder heat trees."),
+ booktabs = TRUE, linesep = "") %>%
+ kable_styling(latex_options = c("striped", "HOLD_position"))
+```
+
+\newpage
+### 5.3 Plot matrix of dendrograms
+From the `igraph` object, dendrograms are drawn using the [`ggraph` package](https://cran.r-project.org/web/packages/ggraph/). The dendrograms representing the individual comparisons are arranged together with a 'key' plot in a matrix using a function adopted from `heat_tree_matrix` function of the [`metacoder` package](https://grunwaldlab.github.io/metacoder_documentation/index.html).
+```{r ggraph_matrix, echo = FALSE, eval = !is.null(ax2_igraphs)}
+incProgress(1/7, message = "Plotting dendrograms...")
+ax2_ggraph <- ggraph_matrix(ax2_igraphs,
+                            seed = seed,
+                            key_size = 0.7,
+                            label_leafs = TRUE,
+                            min_eff_size = cutoff_aldex,
+                            max_adj_p = cutoff_pval,
+                            workdir = workdir, subdir = subdir)
+# export ggraph results file
+saveRDS(ax2_ggraph, file = paste(
+  output_dir9,
+  paste("Pathway", var_test, "ggraph.rds", sep = "."), sep = "/"))
+
+# extract file name and figure legend
+matrix_file <- base::attr(ax2_ggraph[["matrix_pt"]], "file_name")
+matrix_legend <- base::attr(ax2_ggraph[["matrix_pt"]], "fig_legend")
+```
+```{r show_ggraph, eval = !is.null(ax2_igraphs), echo = FALSE, out.width = "100%", fig.width = 8, fig.height = 8, fig.cap = matrix_legend}
+knitr::include_graphics(matrix_file)
+```
+`r if(is.null(ax2_igraphs)) {paste("There were no significant hits to display with ggraph.")} else {paste("This figure was saved with the following name:\n*","", subdir, str_match(matrix_file, ".*/(.*)$")[,2], sep = "/")}`
+
+\newpage
+### 5.4 Plot matrix of heat trees
+From the `metacoder` environment, a matrix of 'heat trees' is drawn using the function `heat_tree_matrix_FA`. The heat trees representing the individual comparisons are arranged together with a 'key tree' in a matrix.
+```{r metacoder_matrix, eval = !is.null(ax2_meta), echo = FALSE}
+incProgress(1/7, message = "Plotting heat trees...")
+ax2_metacoder <- ax2_meta %>%
+    metacoder::mutate_obs("cleaned_names", 
+             stringr::str_wrap(gsub(taxon_names,
+                  pattern = "\\[|\\]|^[a-z]{1}__|__$|^.*s__", replacement = ""),
+                  width = 20, whitespace_only = FALSE)) %>%
+   heat_tree_matrix_FA(
+     data = "diff_table",
+     node_size = hier_number,
+     node_label = cleaned_names,
+     node_color = effect,
+     node_color_trans = "linear",
+     node_size_axis_label = "Number of pathways",
+     node_color_axis_label = "Effect size",
+     node_color_range = rev(colorspace::diverging_hcl(7, palette = "Purple-Green")),
+     label_small_trees = FALSE,
+     key_size = 0.7,
+     seed = seed,
+     layout = "da",
+     initial_layout = "re",
+     workdir = workdir,
+     subdir = subdir
+     )
+# export metacoder results file
+incProgress(1/7, message = "Saving...")
+saveRDS(ax2_metacoder, file = paste(
+  output_dir9,
+  paste("Pathway", var_test, "metacoder.rds", sep = "."), sep = "/"))
+
+# extract file name and figure legend
+metacoder_file <- attr(ax2_metacoder[["matrix_pt"]], "file_name")
+metacoder_legend <- attr(ax2_metacoder[["matrix_pt"]], "fig_legend")
+knitr::opts_knit$set(root.dir = gsub("\\\\", "/", tempdir()))
+```
+```{r show_metacoder, eval = !is.null(ax2_meta), echo = FALSE, out.width = "100%", fig.width = 8, fig.height = 8, fig.cap = metacoder_legend}
+knitr::include_graphics(metacoder_file)
+```
+`r if(is.null(ax2_meta)) {paste("There were no significant hits to display with metacoder.")} else {paste("This figure was saved with the following name:\n*","", subdir, str_match(metacoder_file, ".*/(.*)$")[,2], sep = "/")}`
+
+\newpage
+
+## Record session information
+\tiny
+```{r session_info, echo = FALSE}
+print(sessionInfo())
+```

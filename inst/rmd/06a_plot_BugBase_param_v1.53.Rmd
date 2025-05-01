@@ -1,0 +1,649 @@
+---
+title: "Plot and analyze BugBase results"
+author: "`r params$author`"
+date: "`r format(Sys.time(), '%d.%m.%y')`"
+header-includes:
+- \usepackage{float} #use the 'float' package
+- \floatplacement{figure}{H} #make every figure with caption = h
+- \usepackage{flafter}
+- \usepackage{booktabs}
+- \usepackage{longtable}
+- \usepackage{array}
+- \usepackage{multirow}
+- \usepackage{wrapfig}
+- \usepackage{colortbl}
+- \usepackage{pdflscape}
+- \usepackage{tabu}
+- \usepackage{threeparttable}
+- \usepackage{threeparttablex}
+- \usepackage[normalem]{ulem}
+- \usepackage{makecell}
+- \usepackage{xcolor}
+output:
+  pdf_document:
+    latex_engine: lualatex
+    fig_width: 7.5
+    fig_caption: yes
+    df_print: kable
+    extra_dependencies: ["float"]
+    includes:
+      in_header: header.tex
+  word_document: default
+  html_document:
+    df_print: kable
+    theme: cerulean
+    highlight: haddock
+    toc: yes
+    toc_depth: 3
+    toc_float: TRUE
+    collapsed: FALSE
+    smooth_scroll: TRUE
+    code_fold: show
+params:
+  workdir:
+    label: "working directory"
+    value: "U:/00_Shiny/Test"
+  subfolder:
+    label: "subdirectory"
+    value: !r format(Sys.time(), '%y%m%d')
+  meta_file:
+    label: "rds file with metadata"
+    value: !r NULL
+  var_test:
+    label: "metadata variable used for statistical analysis and plotting"
+    value: NULL
+  var_formula:
+    label: "metadata variable(s) formula used for statistical analysis"
+    value: NULL
+  var_name:
+    label: "variable name for plotting"
+    value: NULL
+  filter_var:
+    label: "variable used for filtering"
+    value: "sample"
+  samples_excluded:
+    label: "vector of samples excluded from analysis"
+    value: NULL
+  samples_outlier:
+    label: "vector of samples identified as outliers"
+    value: !r c()
+  comp_list:
+    label: "list of length-2 character vectors defining comparisons or 'all' for all possible pairs, NULL for no stats"
+    value: !r "all"
+  color_set:
+    label: "define colors, optionally as named vector"
+    value: !r NULL
+  label_set:
+    label: "named vector for plot (x/legend) labels"
+    value: !r NULL
+  label_set_b:
+    label: "named vector for grouped plot (color legend) labels"
+    value: !r NULL
+  min_repl:
+    label: "minimum number of group replicates to calculate statistics"
+    value: 3
+  rm_ns:
+    label: "whether or not remove non-significant comaprisons from plot"
+    value: TRUE
+    choices: [TRUE, FALSE]
+  padj_method:
+    label: "set p value adjustment method"
+    value: fdr
+    choices: [holm, hochberg, hommel, bonferroni, BH, BY, fdr, none]
+  cutoff_pval:
+    label: "cutoff for (adj.) p value"
+    value: 0.05
+  rel_step:
+    label: "relative step height between comparison lines"
+    value: 6
+  grouped:
+    label: "Doing grouped plotting or not"
+    value: FALSE
+    choices: [TRUE, FALSE]
+  dodge_value:
+    label: "amount of dodging for grouped plots"
+    value: 0.9
+  color_param:
+    label: "variable name defining color/shape in grouped plots"
+    value: NULL
+  data_param:
+    label: "variable name defining x-axis in grouped plots"
+    value: NULL
+fontsize: 10pt
+urlcolor: blue
+papersize: a4
+editor_options: 
+  chunk_output_type: console
+  markdown: 
+    wrap: 72
+---
+
+```{r version, echo = FALSE}
+script_version <- "1.53"
+#script_date <- file.info("C:\\MyFolder\\test.csv")$mtime
+```
+
+This is 'Plot and analyze BugBase results' script version **`r script_version`** by Dr. Roman Gerlach.
+
+## Load required libraries
+
+```{r libraries, warning = FALSE, message = FALSE}
+setProgress(1/6, message = "Loading required libraries...")
+library(tidyverse)
+library(ggpubr)
+library(rstatix)
+library(ggtext)
+library(pander)
+library(RColorBrewer)
+library(egg)
+library(patchwork)
+library(broom)
+library(kableExtra)
+```
+
+```{r global_options, echo = FALSE}
+# Set up global options for nice reports and keeping figures:
+workdir <- params$workdir
+current_dir <- paste(workdir, params$subfolder, sep = "/")
+knitr::opts_chunk$set(fig.width = 7.5, fig.align = "center", out.extra = "",
+                      warning = FALSE, message = FALSE, fig.pos = "!H",
+                      cache.path = current_dir,
+                      dev = "cairo_pdf")
+options(knitr.kable.NA = '')
+```
+
+```{r environment, echo = FALSE}
+# source accessory functions, e.g. for working with phyloseq objects
+# source("../helper_functions/functions_accessory.R", local = knitr::knit_global())
+# source("../helper_functions/functions_import.R", local = knitr::knit_global())
+# source("../helper_functions/functions_plotting.R", local = knitr::knit_global())
+set.seed(42)
+```
+
+## 1. Setting up environment and script parameters
+
+The data set was filtered based on the following settings:
+
+-   filter_var = **`r pander::pander(params$filter_var)`**
+-   samples_excluded = **`r ifelse(length(samples_excluded > 0), pander::pander(params$samples_excluded), "none")`** (RegEx applied to variable: `r params$filter_var`)
+-   samples_outlier = **`r ifelse(length(samples_outlier > 0), pander::pander(params$samples_outlier), "none")`** (filtered: sample names)
+
+```{r data_import, echo = FALSE}
+####~~~~~ Import BugBase data ~~~~####
+incProgress(1/6, message = "Importing BugBase results...")
+# metadata variable used for filtering
+filter_var <- params$filter_var
+# pattern (regex) or names of excluded samples based on filter_var
+samples_excluded <- params$samples_excluded
+# pattern (regex) or names of outlier samples
+samples_outlier <- params$samples_outlier
+
+# import metadata
+# meta_file <- "../00_metadata/meta_V14.rds"
+phylo <- readRDS(input$uploadOTUphyseq$datapath)
+meta <- base::as.data.frame(phyloseq::sample_data(phylo[["no_ambig_euk"]]))
+
+# import BugBase results and remove excluded samples
+# get vsearch stats file
+vs_stats_file <- input$uploadbugbasevsearch$datapath
+# extract tax assignment numbers
+if(file.exists(vs_stats_file)) {
+vs_stats <- stringr::str_match(read_lines(vs_stats_file, skip = 9, n_max = 1),
+                  ".*: ([0-9]{1,5}) of ([0-9]{1,5}) (\\(.*\\)$)")}
+
+# get BugBase data file location
+bugbase_file <- input$uploadbugbasepredicts$datapath
+# import and filter bugbase data
+bugbase_wide <- read_tsv(bugbase_file, col_types = cols()) %>%
+  dplyr::rename(sample_ID = ...1) %>%
+  dplyr::semi_join(meta, by = "sample_ID") %>%
+  dplyr::left_join(meta, by = "sample_ID") %>%
+  droplevels()
+
+# pivot to long format
+bugbase_long <- bugbase_wide %>%
+  tidyr::pivot_longer(Aerobic:Stress_Tolerant, names_to = "measure")
+
+# vector of BugBase measures used for plotting
+measure.vars <- c("Aerobic", "Anaerobic", "Facultatively_Anaerobic",
+                  "Gram_Negative", "Gram_Positive", "Potentially_Pathogenic",
+                  "Forms_Biofilms", "Contains_Mobile_Elements", "Stress_Tolerant")
+measure.names <- structure(stringr::str_replace_all(measure.vars, "_", " "), names = measure.vars)
+```
+
+### 1.1 BugBase data
+
+**Input data generation**\
+Because [BugBase](https://doi.org/10.1101/133462) is based upon [PICRUSt v1](https://www.nature.com/articles/nbt.2676), it requires an OTU table in [BIOM version 1.0 (JSON) format](https://biom-format.org/documentation/format_versions/biom-1.0.html) picked against the [Greengenes database](https://doi.org/10.1128/aem.03006-05) (97% identity). To generate this file, a combination of [QIIME 2 v2021.11](https://docs.qiime2.org/) with the latest Greengenes v13.8 taxonomy data base available [here](ftp://greengenes.microbio.me/greengenes_release/gg_13_5/gg_13_8_otus.tar.gz) was applied. The approach was modified from [here](https://github.com/mestaki/qiime2-to-BugBase).
+
+**Prepare Greengenes data**
+
+```{bash, eval = FALSE}
+#run all only once!!
+#make folder
+mkdir ~/Dokumente/Qiime2/references/gg_13_8
+cd ~/Dokumente/Qiime2/references/gg_13_8
+
+#download, extract and import Greengenes db
+wget ftp://greengenes.microbio.me/greengenes_release/gg_13_5/gg_13_8_otus.tar.gz
+tar -xzvf gg_13_8_otus.tar.gz gg_13_8_otus/rep_set/97_otus.fasta
+tar -xzvf gg_13_8_otus.tar.gz gg_13_8_otus/taxonomy/97_otu_taxonomy.txt
+
+#for biom file generation add a new header to the 97_otu_taxonomy.txt file: 
+#add '#OTUID' and 'taxonomy' to first line
+echo -e "#OTUID\ttaxonomy" | cat - ./97_otu_taxonomy.txt > ./97_otu_taxonomy.txt
+
+#activate QIIME 2 conda environment
+conda activate qiime2-2021.11
+
+#import Greengenes data as 'FeatureData' in QIIME 2
+qiime tools import \
+  --type 'FeatureData[Sequence]' \
+  --input-path ./97_otus.fasta \
+  --output-path gg_97_otus.qza
+```
+
+**Taxonomic classification and biom export**\
+QIIME 2 was used to classify the OTU sequences and OTU table from [USERACH v11](https://drive5.com/usearch/) in a closed reference approach at 97% identity against the 97% OTU Greengenes v13.8 representative set using [vsearch](https://peerj.com/articles/2584/). Merging of OTU table and Greengenes classification as well as format conversion was done using the `biom-format` [Python package](https://biom-format.org/).
+
+```{bash, eval = FALSE}
+#import OTU fasta file
+qiime tools import \
+--type 'FeatureData[Sequence]' \
+--input-path OTUs-Seqs.fasta \
+--output-path Usearch-OTUs.qza
+
+#convert USEARCH OTU table in biom format
+biom convert \
+-i OTUs-Table.tab \
+-o Usearch-feature-table-tax.biom \
+--table-type="OTU table" \
+--to-hdf5 \
+--process-obs-metadata taxonomy
+
+#import OTU table (biom file)
+qiime tools import \
+  --input-path Usearch-feature-table-tax.biom \
+  --type 'FeatureTable[Frequency]' \
+  --input-format BIOMV210Format \
+  --output-path Usearch-feature-table.qza
+
+#classify with Greengenes
+qiime vsearch cluster-features-closed-reference \
+  --i-sequences Usearch-OTUs.qza \
+  --i-table Usearch-feature-table.qza \
+  --i-reference-sequences ../../references/gg_13_8/gg_97_otus.qza \
+  --p-perc-identity 0.97 \
+  --p-threads 14 \
+  --o-clustered-table Usearch-table-cr-97.qza \
+  --o-clustered-sequences Usearch-seqs-cr-97.qza \
+  --o-unmatched-sequences Usearch-unmatched-seqs \
+  --verbose &> vsearch.stats.txt
+  
+#extract the underlying biom table within the table-cr-97.qza artifact.
+#'feature-table.biom' saved in hdf5 format  
+qiime tools export \
+  --input-path Usearch-table-cr-97.qza \
+  --output-path $PWD
+
+#add taxonomy to biom file
+biom add-metadata \
+-i feature-table.biom \
+-o feature-table-ggtax.biom \
+--observation-metadata-fp ../../references/gg_13_8/97_otu_taxonomy.txt \
+--sc-separated taxonomy
+
+#convert hdf5 biom file to biom (txt) file
+biom convert \
+--table-type="OTU table" \
+-i feature-table-ggtax.biom \
+-o feature-table-ggtax.txt \
+--to-tsv \
+--header-key taxonomy
+
+#convert to json (biom v1.0.0)
+biom convert \
+-i feature-table-ggtax.txt \
+-o feature-table-ggtax-biom1.biom \
+--table-type="OTU table" \
+--to-json \
+--process-obs-metadata taxonomy
+
+conda deactivate
+```
+
+`r if(exists("vs_stats")) {paste0("Using the above appoach a taxonomy was assigned to ", vs_stats[,2], " out of ",  vs_stats[,3], " **", vs_stats[,4], "** OTUs.")}`
+
+The file `feature-table-ggtax-biom1.biom` was uploaded as input for the online version of [BugBase](https://bugbase.cs.umn.edu/). Default options *without* specifying a mapping file were used for the analysis. The resulting *tar* archive was extracted. The following text file contains the results of the analysis:
+
+\footnotesize
+
+`r str_match(bugbase_file, ".*(BugBase.*$)")[,2]` \normalsize
+
+BugBase analyses can also be run locally using the following bash script:
+
+```{bash, eval = FALSE}
+#install BugBase in conda environment
+conda create -n bugbase -c sjanssen2 bugbase
+
+#activate BugBase environment
+conda activate bugbase
+
+#run BugBase
+run.bugbase.r -i ./feature-table-ggtax-biom1.biom -o ./BugBase_Analyses -a
+
+conda deactivate
+```
+
+Given a user's OTU table, BugBase first normalizes the OTU by predicted 16S copy-number, and then predicts microbiome phenotypes using provided precalculated files and an approach for automatic pathway coverage estimation. BugBase predicts that an OTU possesses a phenotype based on an empirical annotation in the cases of Gram staining and oxygen tolerance, or using precalculated traits derived from KEGG Orthologies (KOs) of the corresponding genomes. Relative abundances for the following high level phenotypes were analyzed:
+
+`r pander::pander(measure.vars)`
+
+-   **Aerobic** = Oxygen-depending organisms
+-   **Anaerobic** = living, active, occurring, or existing in the absence of free oxygen
+-   **Facultatively_Anaerobic** = organism that makes ATP by aerobic respiration if oxygen is present, but is capable of switching to fermentation if oxygen is absent
+-   **Gram_Negative** = Gram staining negative (diderm) organism
+-   **Gram_Positive** = Gram staining positive (monderm) organism
+-   **Potentially_Pathogenic** = predicted potentially pathogenic
+-   **Forms_Biofilms** = predicted to form biofilms
+-   **Contains_Mobile_Elements** = predicted to contain mobile genetic elements
+-   **Stress_Tolerant** = predicted to be stress tolerant
+
+For more information see the [BugBase manuscript](https://doi.org/10.1101/133462).
+
+### 1.2 Define contrasts
+
+Two group comparisons are defined by a list of character vectors of length two. The list is used to filter from all possible comparisons. The order of the two elements is irrelevant. Depending on data distribution, either *t*-test (normal distribution) or Wilcoxon rank sum test (non-normal distribution) is applied.\
+The following factor levels of variable **`r params$var_test`** are compared: `r if(typeof(params$comp_list) == "list") {pander::pander(params$comp_list)} else if(typeof(params$comp_list) == "character" & params$comp_list == "all") {"Doing all possible comparisons."}`
+
+A function is used to check whether the list with pairwise comparisons is valid:
+
+```{r analysis_vars, echo = FALSE}
+# variable to analyze
+var_test <- params$var_test
+var_formula <- params$var_formula
+var_name <- params$var_name
+# import comparison list
+comp.list <- params$comp_list
+```
+
+`r pander::pander(check_comp_list(x = comp.list, ref = bugbase_wide))`
+
+### 1.3 Parameters for statistical analyses
+
+The following parameters were used of for statistical comparison of BugBase results:
+
+-   var_test = **`r pander::pander(var_test)`**
+-   var_formula = `r pander::pander(params$var_formula)`
+-   var_name = **`r pander::pander(params$var_name)`**
+-   Do statistical analysis of comparisons: **`r if(!is.null(params$comp_list)) "yes" else "no"`**
+-   Minimum number of within-group replicates to do statistics: **`r params$min_repl`**
+-   *p*-value adjustment method = **`r pander::pander(params$padj_method)`**
+-   Threshold for significance: **`r params$cutoff_pval`**
+-   Remove non-significant comparisons: **`r if(params$rm_ns) "yes" else "no"`**
+-   Relative step width between individual significance brackets = **`r params$rel_step`%**
+
+```{r plot_parameters, echo = FALSE}
+# statistics parameters
+do.stat <- params$do_stat
+rm.ns <- params$rm_ns
+min_repl <- params$min_repl
+p.adj.method <- params$padj_method
+cutoff_pval <- params$cutoff_pval
+
+# define space between single stat comparison bars in relative (% of max) y units
+rel.step <- params$rel_step
+
+# grouped plot settings
+grouped <- if(params$grouped & !is.null(params$color_param) & !is.null(params$data_param)) TRUE else FALSE
+dodge.value <- params$dodge_value
+color.param <- if(grouped) params$color_param else NULL
+data.param <- if(grouped) params$data_param else NULL
+
+# color and label sets
+color.set <- params$color_set
+label.set <- params$label_set
+label.set.b <- params$label_set_b
+```
+
+**Plot settings:** `r if(params$grouped & !is.null(params$color_param) & !is.null(params$data_param)) {paste0("Doing grouped plotting using variable '", params$color_param, "' for ", ifelse(!is.null(params$color_set), "coloring", "shape"), " and variable '", params$data_param, "' for categories.")} else if(params$grouped & (is.null(params$color_param) | is.null(params$data_param))) {paste("Color or data variable not defined for grouped plotting - Doing ungrouped plot!")} else if(!params$grouped) paste("Doing ungrouped plotting.")`
+
+color set: `r show_color_set(color.set)`
+
+label set: `r if(grouped) show_label_set(label.set.b) else show_label_set(label.set)`
+
+### 1.4 Determine mode of data distribution
+
+The pairwise statistical comparisons should only be done for factor levels of variable `r var_test` with at least **`r min_repl`** replicates. Therefore, a function is applied to identify groups with less than `r min_repl` replicates. The corresponding samples are subsequently removed before analyses.
+
+```{r check_replicates, echo = FALSE}
+# before = bugbase_long
+# group_param = "day_arginine" #"arginine2" #"day_arginine"
+# min_repl = 3
+# low_replicates <- filtered_levels(before = bugbase_long, group_param = "day_arginine", min.repl = 3)
+low_replicates <- filtered_levels(before = bugbase_long)
+```
+
+`r if(is.null(low_replicates[[1]])) paste("Each group had at least", min_repl, "replicates. No samples were removed.")`
+
+```{r low_replicates_tbl, eval = !is.null(low_replicates[[2]]), echo = FALSE, out.extra = ''}
+# using captions in combination with kable_style position options requires to escape '_' with '\\'
+ kableExtra::kbl(low_replicates[[2]], caption = paste("Overview of the factor levels of variable", stringr::str_replace_all(var_test, "_", "\\\\_"), "removed before statistical analyses because of low number of replicates (Frequency)."),
+ booktabs = TRUE, linesep = "", digits = 3, format.args = list(big.mark = ",")) %>%
+ kableExtra::kable_styling(latex_options = c("striped", "HOLD_position"))
+```
+
+The Shapiro test is used to determine whether the data underlying a BugBase high level phenotype is normal distributed or not. This is done after removing factor levels with low number of replicates (see above).\
+When the data *is* normal distributed (Shapiro test *p* \> 0.05), the *t*-test is applied for pairwise comparisons. This parametric test compares the *means* of two groups and assumes that the data are (1) independent, (2) approximately normally distributed and (3) have similar amounts of variance within each group being compared. The null hypothesis is that the true difference between these group means is zero.\
+When the data is *not* normally distributed (Shapiro test *p* \< 0.05), the Wilcoxon rank sum test is applied for pairwise comparisons. This nonparametric statistical test can be used to investigate whether two independent cohorts consist of samples that were selected from populations having the same high level phenotype distribution. The null hypothesis thereby is that the probability that a randomly selected value from one cohort is less than a randomly selected value from a second cohort is equal to the probability of being greater.
+
+```{r norm_check_fct, echo = FALSE}
+# function to check for normal distribution of data
+norm_test <- function(df) {
+  x <- df %>%
+    dplyr::group_by(measure) %>%
+    dplyr::summarize(Shapiro.test = shapiro.test(value)$p.value) %>%
+    # return "Wilcoxon" for non-normal and "t-test" for normal distribution
+    dplyr::mutate(
+      Normal.dist = ifelse(Shapiro.test < 0.05, "no", "yes"),
+      Stat.test = ifelse(Shapiro.test < 0.05, "Wilcoxon", "t-test")) %>%
+    dplyr::select(Measure = measure, Shapiro.test, Normal.dist, Stat.test)
+}
+```
+
+```{r stats_table, eval = length(measure.vars) != 0, echo = FALSE}
+# check data distribution
+if(!is.null(low_replicates[[1]])) {
+  stat_used <- norm_test(dplyr::filter(bugbase_long, !get(var_test) %in% low_replicates[[1]]))
+  } else {stat_used <- norm_test(bugbase_long)}
+
+# display summary df using kable
+# using captions in combination with kable_style position options requires to escape '_' with '\\'
+ kableExtra::kbl(stat_used, caption = "Overview of data distribution of BugBase high level phenotypes. The Shapiro test (Shapiro.test) was used to determine whether the data is normal distributed or not (Normal.dist). The resulting appropriate test (t-test or Wilcoxon rank sum test) for pairwise comparisons (Stat.test) is shown.",
+ booktabs = TRUE, linesep = "", digits = 3, format.args = list(big.mark = ",")) %>%
+ kable_styling(latex_options = c("striped", "HOLD_position"))
+```
+
+## 2. Plotting functions
+
+### 2.1 Function for single parameter plotting
+
+The main function `plot_box_scatter` performs pairwise comparisons with the appropriate statistical test (Wilcoxon rank sum or *t*-test). The `add_xy_position` function from the [`rstatix`](https://github.com/kassambara/rstatix) package is used to prepare a data frame for manual plotting of error bars. Plotting is done using the `ggplot2` geom `stat_pvalue_manual` from the [`ggpubr`](https://rpkgs.datanovia.com/ggpubr/) package with the filtered `rstatix`-derived data frame as input.
+
+### 2.2 Function to loop through all parameters
+
+With the function `plot_box_scatter_list` the `plot_box_scatter` function is applied to all high level phenotype parameters defined in `measure.vars`. The result is a list of plots which are combined to a single figure using the [`patchwork`](https://patchwork.data-imaginist.com/) package.
+
+```{r box_scatter_loop, echo = FALSE}
+# function to loop through all high level phenotype parameters
+# df = bugbase_long
+# group_param = "arginine2"
+# measure_vars = measure.vars
+# do_stat = TRUE
+# which_stat = "t-test"
+# comp_list =   list(
+#     c("none", "reference"),
+#     c("arg1", "reference"),
+#     c("arg3", "reference"),
+#     c("DSS", "reference"),
+#     c("arg1", "none"),
+#     c("arg3", "none"),
+#     c("DSS", "none"),
+#     c("arg3", "arg1"),
+#     c("DSS", "arg1"),
+#     c("DSS", "arg3")
+#   )
+# rm_ns = TRUE
+# rel_step = rel.step
+# label_set = c(
+#   "reference" = "reference", "none" = "no arg",
+#   "arg1" = "1% arg", "arg3" = "3% arg", "DSS" = "DSS"
+# )
+incProgress(1/6, message = "Plotting BugBase results...")
+plot_box_scatter_list <- function(
+    measure_vars. = measure.vars,
+    df. = bugbase_long,
+    group_param. = var_test,
+    group_name. = var_name,
+    comp_list. = comp.list, #"all" NULL
+    p_adj_method. = p.adj.method,
+    rm_ns. = rm.ns,
+    rel_step. = rel.step,
+    label_set. = label.set,
+    label_set_b. = label.set.b,
+    color_set. = color.set, #NULL, #color.set,
+    do_grouped_pt. = grouped,
+    dodge_value. = dodge.value,
+    color_param. = color.param,
+    data_param. = data.param) {
+  
+  # remove samples with no data in group_param
+  df. <- df.[as.vector(!is.na(df.[, group_param.])), ]
+  
+  # initiate empty list to store plots
+  plot.list <- setNames(vector("list", length(measure_vars.)), measure_vars.)
+  
+  # loop through all parameters within measure_vars vector
+  for (i in measure_vars.) {
+    plot.list[[i]] <- plot_box_scatter(
+      df.. = df.,
+      group_param.. = group_param.,
+      group_name.. = group_name.,
+      measure_param = i,
+      which_stat = pull(stat_used[stat_used$Measure == i, "Stat.test"]),
+      comp_list.. = comp_list.,
+      p_adj_method.. = p_adj_method.,
+      rm_ns.. = rm_ns.,
+      rel_step.. = rel_step.,
+      label_set.. = label_set.,
+      label_set_b.. = label_set_b.,
+      color_set.. = color_set.,
+      do_grouped_pt.. = do_grouped_pt.,
+      dodge_value.. = dodge_value.,
+      color_param.. = color_param.,
+      data_param.. = data_param.,
+	  legend_rows = 2)
+  }
+  plot.list
+}
+
+# do the plotting
+fig <- plot_box_scatter_list()
+
+# save rds for debugging..
+saveRDS(fig, file = paste0(output_dir6, "/bugbase_figs.rds"))
+```
+
+```{r combine_plots, echo = FALSE}
+# library(patchwork)
+fig.out <- patchwork::wrap_plots(fig) &
+  ggplot2::theme(legend.position = "bottom",
+        plot.margin = margin(t = -0.4, r = -0.3, b = -0.6, l = 0, unit = "cm"),
+        legend.margin = margin(t = -0.3, l = 2, unit = "cm")) #top, right, bottom, left 
+
+fig.out <- fig.out +
+            guide_area() +
+            patchwork::plot_layout(
+              ncol = 3,
+              widths = unit(c(length(unique(dplyr::pull(bugbase_long[, var_test]))) + 0.5),
+                            c('cm')),
+              heights = unit(c(rep(6.5, 3), 1.8), 'cm'), # 4th value: height of collected guide  
+              guides = 'collect'
+            )
+
+# https://patchwork.data-imaginist.com/articles/guides/annotation.html
+fig.out <-  fig.out + plot_annotation(tag_levels = 'A')
+
+# figure export settings
+fig_name <- paste("BugBase", var_test, p.adj.method, "png", sep = ".")
+fig_path <- paste(output_dir6, fig_name, sep = "/")
+fig_width <- length(unique(dplyr::pull(bugbase_long[, var_test])))*3 + 8.5
+
+# save file
+ggsave(filename = fig_path, plot = fig.out,
+       width = fig_width,
+       height = ifelse(
+         grouped | (is.null(color.set) & !grouped), 32+0.2*max(nchar(label.set)), 28.5),
+       units = "cm", dpi = 300, bg = "white")
+
+```
+
+\newpage
+
+```{r show_overviews, echo = FALSE, out.width = "17cm", out.height = "23cm", fig.align = 'center', fig.cap = paste("Pairwise comparisons of the different high level phenotypes determined by BugBase. Comparisons were done as indicated.", low_replicates[[3]], "Either Wilcoxon or t-test was used (see Table above) to calculate significance which was defined as follows: * = adj. p < 0.05, ** = adj. p < 0.01 and *** = adj. p < 0.001.")}
+knitr::include_graphics(fig_path)
+```
+
+The plot image was exported to the following file:\
+\footnotesize `r paste("", params$subfolder, "bugbase/figures", fig_name, sep = "/")` \normalsize
+
+## 3. Statistics calculation and data export
+
+### 3.1 Function for calculating all statistics for all BugBase high level phenotypes
+
+The function `export_data_stats` calculates all statistics and exports the results and (sorted) raw data to an Excel file (via a list). First, the Shapiro test is used to determine the underlying data distribution (normal or non-normal). Subsequently, the following analyses are done:
+
+-   Normally distributed data:
+    -   **ANOVA** is used to assess whether overall differences exist in the data
+    -   **pairwise** ***t*** **-test** is used to fo all the pairwise comparisons between all factor levels of the variable.
+-   Non-normally distributed data:
+    -   **Kruskal-Wallis-test** this non-parametric test is used to determine whether there are differences between the groups.
+    -   **pairwise Wilcoxon rank sum test** is used to fo all the pairwise comparisons between all factor levels of the variable.
+-   An multivariate 'analysis of variance' (**AOV**) is done using the formula supplied in `var_formula`. Significant results suggest at least one mean of the groups differs from the others.
+-   The Tukey's HSD (honestly significant difference) test is used as post-hoc test on the AOV results. This test does pairwise comparisons between the means of all groups.
+
+```{r calc_stats, echo = FALSE}
+## function to export statistics and raw data to Excel
+
+# group_param = "day_arginine"
+# group_formula = "day*arginine"
+# df = bugbase_long
+# measure_vars = c("Observed", "Chao1", "ACE", "Shannon", "Simpson", "InvSimpson", "Fisher")
+# p_threshold = 0.05
+# p.adj.method = "fdr"
+# calculate statistics
+incProgress(1/6, message = "Calculating statistics...")
+tests_summary <- export_data_stats(df = bugbase_long)
+```
+
+### 3.2 Export data to Excel
+
+```{r export_excel, echo = FALSE}
+# export data to Excel
+incProgress(1/6, message = "Saving...")
+file_name <- paste("BugBase", var_test, p.adj.method, "xlsx", sep = ".")
+file_path <- paste(output_dir6, file_name, sep = "/")
+writexl::write_xlsx(tests_summary, path = file_path)
+```
+
+The summarized data was exported to the following Excel file:
+
+\footnotesize `r paste("", params$subfolder, "bugbase", file_name, sep = "/")` \normalsize
+
+## Record session information
+
+\tiny
+
+```{r session_info, echo = FALSE}
+print(sessionInfo())
+```

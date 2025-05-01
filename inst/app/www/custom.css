@@ -1,0 +1,20 @@
+body {color: white !important; background-color: black !important;}
+.selectize-dropdown-content .option[data-value='grey60'] {background-color: #999999; color: black;}
+.selectize-dropdown-content .option[data-value='black'] {background-color: black; color: white;}
+.selectize-dropdown-content .option[data-value='tomato'] {background-color: tomato; color: white;}
+.selectize-dropdown-content .option[data-value='red4'] {background-color: #8b0000; color: white;}
+.selectize-dropdown-content .option[data-value='skyblue'] {background-color: skyblue; color: black;}
+.selectize-dropdown-content .option[data-value='deepskyblue4'] {background-color: #00688b; color: white;}
+.selectize-dropdown-content .option[data-value='olivedrab3'] {background-color: #9acd32; color: black;}
+.selectize-dropdown-content .option[data-value='olivedrab'] {background-color: olivedrab; color: black;}
+.selectize-dropdown-content .option[data-value='pink'] {background-color: pink; color: black;}
+.selectize-dropdown-content .option[data-value='violetred'] {background-color: #d02090; color: white;}
+.selectize-dropdown-content .option[data-value='orchid1'] {background-color: #ff83fa; color: black;}
+.selectize-dropdown-content .option[data-value='darkmagenta'] {background-color: darkmagenta; color: white;}
+.selectize-dropdown-content .option[data-value='cyan'] {background-color: cyan; color: black;}
+.selectize-dropdown-content .option[data-value='aquamarine4'] {background-color: #458b74; color: white;}
+.selectize-dropdown-content .option[data-value='yellow2'] {background-color: #eeee00; color: black;}
+.selectize-dropdown-content .option[data-value='yellow4'] {background-color: #8b8b00; color: black;}
+.selectize-dropdown-content .option[data-value='lightsalmon'] {background-color: lightsalmon; color: black;}
+.selectize-dropdown-content .option[data-value='chocolate'] {background-color: chocolate; color: white;}
+

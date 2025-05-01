@@ -1,0 +1,984 @@
+---
+title: "Analysis of Beta diversity"
+author: "`r params$author`"
+date: "`r format(Sys.time(), '%d.%m.%y')`"
+header-includes:
+- \usepackage{float} #use the 'float' package
+- \floatplacement{figure}{H} #make every figure with caption = h
+- \usepackage{flafter}
+- \usepackage{booktabs}
+- \usepackage{longtable}
+- \usepackage{array}
+- \usepackage{multirow}
+- \usepackage{wrapfig}
+- \usepackage{colortbl}
+- \usepackage{pdflscape}
+- \usepackage{tabu}
+- \usepackage{threeparttable}
+- \usepackage{threeparttablex}
+- \usepackage[normalem]{ulem}
+- \usepackage{makecell}
+- \usepackage{xcolor}
+output:
+  pdf_document:
+    latex_engine: lualatex
+    fig_width: 18
+    fig_height: 21
+    fig_caption: yes
+    df_print: kable
+    extra_dependencies: ["float"]
+    includes:
+      in_header: header.tex
+  word_document: default
+  html_document:
+    df_print: kable
+    theme: cerulean
+    highlight: haddock
+    toc: yes
+    toc_depth: 3
+    toc_float: TRUE
+    collapsed: FALSE
+    smooth_scroll: TRUE
+    code_fold: show
+params:
+  author:
+    label: "author of the analysis"
+    value: "no author given"
+  workdir:
+    label: "U:/00_Shiny/Test"
+    value: NULL
+  subfolder:
+    label: "subdirectory"
+    value: !r format(Sys.time(), '%y%m%d')
+  TU_type:
+    label: "type of taxonomic units analyzed"
+    value: OTU
+    choices: [ZOTU, OTU]
+  analysis_level:
+    label: "taxonomic level to analyze"
+    value: OTU
+    choices: [TU, Genus]
+  var_test:
+    label: "metadata variable to analyze"
+    value: NULL
+  var_comp_test:
+    label: "combination of metadata variables for multivariate analysis"
+    value: NULL
+  var_name:
+    label: "variable name for plotting"
+    value: NULL
+  shape_var:
+    label: "optional variable to use for point shape"
+    value: NULL
+  trans_methods:
+    label: "choose one or more normalization methods"
+    value: !r c("CLR2", "CLR")
+  dist_methods:    
+    label: "choose one or more distance matrix calculation methods"
+    value: !r c("bray", "guni")
+  ord_methods:
+    label: "choose one or more Ordination methods"
+    value: !r c("MDS", "NMDS", "tSNE", "UMAP")
+  color_set:
+    label: "define colors, optionally as named vector"
+    value: !r NULL
+  label_set:
+    label: "named vector for plot labels"
+    value: !r NULL
+fontsize: 10pt
+urlcolor: blue
+papersize: a4
+editor_options: 
+  chunk_output_type: console
+---
+```{r version, echo = FALSE}
+script_version <- "1.15"
+#script_date <- file.info("C:\\MyFolder\\test.csv")$mtime
+```
+This is 'Analysis of Beta diversity' script version **`r script_version`** by Dr. Roman Gerlach.
+
+### Load required libraries
+```{r libraries, echo = TRUE, results = 'hide', warning = FALSE, message = FALSE}
+setProgress(1/8, message = "Loading required libraries...")
+library(tidyverse)
+library(pander)
+library(doParallel)
+library(phyloseq)
+library(pairwiseAdonis)
+library(vegan)
+library(broom)
+library(DESeq2)
+library(RColorBrewer)
+library(kableExtra)
+library(egg)
+library(patchwork)
+library(cowplot)
+library(gtable)
+library(lemon)
+library(ggplotify)
+library(ggtext)
+library(writexl)
+library(Polychrome)
+```
+```{r global_options, echo = FALSE}
+# Set up global options for nice reports and keeping figures:
+current_dir <- paste(params$workdir, params$subfolder, sep = "/")
+knitr::opts_chunk$set(fig.width = 7, fig.align = "center", out.extra = "",
+                      warning = FALSE, message = FALSE, fig.pos = "!H",
+                      cache.path = current_dir,
+                      dev = "cairo_pdf")
+options(knitr.kable.NA = '')
+```
+```{r environment, echo = FALSE}
+# setting TU type
+TU_type <- ifelse(params$TU_type == "OTU", FALSE, TRUE)
+# setting analysis level
+# use either taxonomic units or TUs agglomerated at genus level
+analysis_level <- ifelse(params$analysis_level == "Genus", FALSE, TRUE)
+
+# check and create directory structure
+if(!dir.exists(paste0(current_dir, "/beta_diversity"))) {dir.create(paste0(current_dir, "/beta_diversity"))}
+if(!dir.exists(paste0(current_dir, "/beta_diversity/data"))) {dir.create(paste0(current_dir, "/beta_diversity/data"))}
+if(!dir.exists(paste0(current_dir, "/beta_diversity/figures"))) {dir.create(paste0(current_dir, "/beta_diversity/figures"))}
+
+# source required functions
+# source("../helper_functions/functions_plotting.R", local = knitr::knit_global())
+# source("../helper_functions/functions_accessory.R", local = knitr::knit_global())
+
+set.seed(42)
+```
+### Setting up environment and script parameters
+
+Type of imported taxonomic units (TUs)
+
+`r ifelse(TU_type, paste0("Taxonomic data is present in the form of **ZOTUs/ASVs** (Zero-radius Operational Taxonomic Units/Amplicon Sequence Variants)"), paste0("Taxonomic data is present in the form of **OTUs** (Operational Taxonomic Units)"))`
+
+The data is analyzed at the `r ifelse(analysis_level, ifelse(TU_type, "ZOTUs/ASVs", "OTUs"), "genus")` level.
+
+```{r analysis_parameters, echo = FALSE}
+# set grouping variable(s) to compare
+var_test <- params$var_test
+var_comp_test <- params$var_comp_test
+var_name <- params$var_name
+shape_var <- params$shape_var
+
+#choose count transformation method(s)
+#options: "ori", "ra", "log", "hell", "RLE", "vst, "CLR", "CLR2"
+trans_methods <- params$trans_methods
+
+#choose distance method(s)
+#options: "uni", "wuni", "guni", "bray"
+dist_methods <- params$dist_methods
+
+#choose ordination method(s)
+#options: "MDS", "NMDS", "tSNE", "UMAP"
+ord_methods <- params$ord_methods
+
+# settings for plotting
+color_set <- params$color_set
+# color_set <- ifelse(is.null(params$color_set), brewer.pal(12, name = "Paired"),
+#                     params$color_set)
+label_set <- params$label_set
+```
+The following variable(s) were set comparative statistics and plotting:    
+
+* var_test = `r paste0("**",var_test, "**")`
+* var_comp_test = `r var_comp_test`
+* var_name = `r paste0("**", var_name, "**")`
+* shape_var = `r ifelse(is.null(shape_var), "none", paste0("**", shape_var, "**"))`    
+
+\newpage
+color_set:
+`r show_color_set(color_set)`
+
+label_set:
+`r show_label_set(label_set)`
+
+Select the ordination and normalization method(s) showing best group separation:
+
+* Count transformation method(s): **`r pander::pander(trans_methods)`**
+* Distance method(s): **`r pander::pander(dist_methods)`**
+* Ordination method(s): **`r pander::pander(ord_methods)`**
+
+```{r data_import, echo = FALSE, results = 'hide'}
+# file names
+incProgress(1/8, message = "Importing required files...")
+trans_file <- ifelse(analysis_level,
+                     ifelse(TU_type, input$uploadZOTUtrans$datapath, input$uploadOTUtrans$datapath),
+                     ifelse(TU_type, input$uploadZOTUtransgenus$datapath, input$uploadOTUtransgenus$datapath)) %>%
+  gsub("\\\\", "/", .)
+dists_file <- ifelse(analysis_level,
+                     ifelse(TU_type, input$uploadZOTUdists$datapath, input$uploadOTUdists$datapath),
+                     ifelse(TU_type, input$uploadZOTUdistsgenus$datapath, input$uploadOTUdistsgenus$datapath)) %>%
+  gsub("\\\\", "/", .)
+ord_file <- ifelse(analysis_level,
+                     ifelse(TU_type, input$uploadZOTUord$datapath, input$uploadOTUord$datapath),
+                     ifelse(TU_type, input$uploadZOTUordgenus$datapath, input$uploadOTUordgenus$datapath)) %>%
+  gsub("\\\\", "/", .)
+
+# import rds files
+transform_list  <- readRDS(trans_file)
+dists <- readRDS(dists_file)
+ord.all <- readRDS(ord_file)
+```
+
+## Import distance and ordination data stored in phyloseq objects
+Depending on the analysis level, the following RDS-files harboring count transformations, distance matrices and ordination results are imported:
+
+\footnotesize
+`r paste0("* ", params$workdir, "/",trans_file,  "\n* ", params$workdir, "/", dists_file, "\n* ", params$workdir, "/", ord_file)`
+\normalsize
+
+\newpage
+## Plot different combinations of count transformation, distance matrix and ordination 
+For plotting either the ['plot_ordination'](https://joey711.github.io/phyloseq/plot_ordination-examples.html) function of the `phyloseq` package or a custom function (for t-SNE and UMAP) is used.
+```{r plot_ord_fct, results = 'hide', echo = FALSE}
+# source("../helper_functions/functions_plotting.R")
+# group_param = var_test
+# trans_meth <- "CLR"
+# dist_meth <- "gower"
+# ord_meth <- "tSNE"
+# transform_list <- readRDS(paste0(workdir, "/data/transform_list_genus_otu.rds"))
+# # dist_meth <- readRDS(paste0(workdir, "/data/dists_list_genus_otu.rds"))
+# ord.all <- readRDS(paste0(workdir, "/data/ordination_list_genus_otu.rds"))
+# analysis_level <- FALSE
+# TU_type <- FALSE
+
+# Export an combine selected count transformation/ordination combinations
+incProgress(1/8, message = "Plotting dimensionality reduction techniques...")
+plot_save_ord <- function(trans_meth, dist_meth, ord_meth, group_param = var_test) {
+   #-----------new------------
+  ord_key <- paste(ord_meth, dist_meth, sep = ".")
+  ord_obj <- ord.all[[trans_meth]][[ord_key]]
+  
+  if (is.null(ord_obj)) {
+    message(paste("Skipping", ord_meth, "on", dist_meth, "due to low sample variety"))
+    ord_methods <- ord_methods[ord_methods != ord_obj]
+    return(NULL)
+  }
+  
+  # generate plot title
+  plot_title <- paste(
+    ord_meth, "on", dist_names[dist_meth], "distance of\n",
+    trans_names[trans_meth], ifelse(analysis_level, ifelse(
+      TU_type, "ZOTUs/ASVs", "OTUs"), paste0(
+        "genus (based on ", ifelse(TU_type, "ZOTUs/ASVs", "OTUs"), ")")),
+    "count data")
+  
+  if (ord_meth == "tSNE") {
+  p1 <- plot_ord(
+    phylo_obj = transform_list[[trans_meth]],
+    ord_obj = ord.all[[trans_meth]][[paste(ord_meth, dist_meth, sep = ".")]],
+    group_param = var_test, title = plot_title, type = "tSNE")
+  } else if (ord_meth == "UMAP") {
+  p1 <- plot_ord(
+    phylo_obj = transform_list[[trans_meth]],
+    ord_obj = ord.all[[trans_meth]][[paste(ord_meth, dist_meth, sep = ".")]],
+    group_param = var_test, title = plot_title, type = "UMAP")
+  } else {
+  p1 <- plot_ord(
+    phylo_obj = transform_list[[trans_meth]],
+    ord_obj = ord.all[[trans_meth]][[paste(ord_meth, dist_meth, sep = ".")]],
+    group_param = var_test, title = plot_title, type = "other", fix_asp_1 = FALSE)
+  }
+  
+  p2 <- fix_ggplot_panel(p = p1, p.margin = 20, p.width = 12)
+  ggsave(filename = paste(
+    output_dir7, paste0(
+         ifelse(TU_type, "ZOTUs.", "OTUs."), if(!analysis_level) {"genus."},
+         trans_meth, ".", dist_meth, ".", ord_meth, ".png"), sep = "/"),
+         plot = p2, bg = "white", dpi = 300,
+         width = attr(p2, "plot_width"), height = attr(p2, "plot_height"))
+  
+  return(p1)
+}
+```
+```{r plot_ord_loop, echo = FALSE}
+# define all combinations of norm, dist and ordination
+fct_vars <- tidyr::expand_grid(trans_methods, dist_methods, ord_methods)
+allplots <- pmap(fct_vars, ~plot_save_ord(trans_meth = ..1,
+                                          dist_meth = ..2,
+                                          ord_meth = ..3,
+                                          group_param = var_test) ) %>%
+  setNames(paste(fct_vars$trans_methods, fct_vars$dist_methods, fct_vars$ord_methods, sep = "."))
+
+# save rds for debugging..
+saveRDS(allplots, file = paste(output_dir7,
+        paste0(ifelse(TU_type, "ZOTUs.", "OTUs."), if(!analysis_level) {"genus."},"ordination_figs.rds"), sep = "/"))
+# adjust aspect ratio
+allplots <- lapply(allplots, function(x) {x + theme(aspect.ratio = 1)})
+ord_methods
+```
+```{r plot_ord, echo = FALSE, fig.width = 18, fig.height = 21, fig.cap = "Plots of all combinations of ordination, distance matrix calculation and count normalization methods. For simplicity the aspect ratio was set to one and does not correspond to the Eigenvalues. The Eigenvalues (when available) were used to set the aspect ratio for the exported single figures."}
+# arrange all plots within list
+# ggpubr common legend works well but aspect ratio is set to an arbritary value
+ggpubr::ggarrange(plotlist = allplots, ncol = length(ord_methods),
+                  nrow = ceiling(length(allplots)/length(ord_methods)),
+                  common.legend = TRUE, legend = "bottom", align = "hv")
+```
+\newpage
+## Plot all pairwise distances
+For plotting a modified version of the `phyloseq_distance_boxplot` function available [here](https://github.com/fconstancias/DivComAnalyses/) is used.
+```{r pair_dist_fct, echo = FALSE}
+incProgress(1/8, message = "Plotting pairwise distances...")
+
+# function to plot all pairwise distances
+phyloseq_distance_boxplot <- function(
+    phylo_obj, dm, d = "SampleType", filter = NULL) {
+
+  require("phyloseq"); require("tidyverse")
+
+  as.matrix(dm)[sample_names(phylo_obj),sample_names(phylo_obj)] %>%
+    as.dist() -> dm
+
+  # modify distance matrix
+  wu.m <- reshape2::melt(as.matrix(dm))
+
+  # remove self-comparisons
+  wu.m <- wu.m %>%
+    filter(as.character(Var1) != as.character(Var2)) %>%
+    mutate_if(is.factor, as.character)
+
+  # get sample data (S4 error OK and expected)
+  sd <- sample_data(phylo_obj) %>%
+    data.frame() %>%
+    rownames_to_column("tmp") %>%
+    dplyr::select(tmp, all_of(d)) %>%
+    mutate_if(is.factor,as.character)
+
+  # combined distances with sample data
+  colnames(sd) <- c("Var1", "Type1")
+  wu.sd <- dplyr::left_join(wu.m, sd, by = "Var1")
+
+  colnames(sd) = c("Var2", "Type2")
+  wu.sd <- dplyr::left_join(wu.sd, sd, by = "Var2") %>%
+      dplyr::mutate(
+        Type1 = factor(Type1, levels = levels(get_variable(phylo_obj, var_test))),
+        Type2 = factor(Type2, levels = levels(get_variable(phylo_obj, var_test))))
+
+  if(!is.null(filter)){
+    wu.sd <- wu.sd %>%
+      dplyr::filter(Type1 == !!filter) 
+  }
+
+  # plot
+  pt = ggplot(wu.sd, aes(x = Type2, y = value)) +
+    geom_jitter(aes(color = ifelse(Type1 == Type2, "red", "black")),
+                alpha = 0.1)+
+    geom_boxplot(aes(color = ifelse(Type1 == Type2, "red", "black")),
+                 fill = NA,
+                 outlier.shape = NA,
+                 outlier.colour = NA) +
+    scale_color_identity() +
+    scale_x_discrete(labels = label_set) +
+    facet_wrap(vars(Type1), labeller = as_labeller(label_set)) +
+    egg::theme_article() +
+    ylab("Distance") + xlab(NULL) +
+    theme(axis.text.x = element_markdown(angle = 45, hjust = 1, vjust = 1),
+          legend.text = element_markdown(),
+          strip.text = element_markdown())
+  # return
+  out = list(plot = pt,
+             matrix = wu.sd)
+  return(out)
+}
+
+# Export an combine selected count transformation/distance matrix combinations
+plot_pair_dists <- function(trans_meth, dist_meth, group_param = var_test) {
+  
+  # generate plot title
+  plot_title <- paste(
+    "Pairwise comparisons of", dist_names[dist_meth], "distances of",
+    trans_names[trans_meth] , ifelse(analysis_level, ifelse(
+      TU_type, "ZOTUs/ASVs", "OTUs"), paste0(
+        "genus (based on ", ifelse(TU_type, "ZOTUs/ASVs", "OTUs"), ")")),
+    "count data")
+  
+  out <- phyloseq_distance_boxplot(
+    phylo_obj = transform_list[[trans_meth]],
+    dm = dists[[trans_meth]][[dist_meth]], # distance matrix
+    d = group_param)
+
+  p.width. <- length(base::unique(out$matrix$Type2)) + 0.5
+
+  p1 <- fix_ggplot_panel(p = out$plot, p.margin = 10, p.width = p.width.,
+                         p.height = 6)
+  p2 <- p1 +
+    ggtitle(str_replace(plot_title, "distances of ", "distances of\n")) +
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  ggsave(filename = paste(
+    output_dir7, paste0(
+      ifelse(TU_type, "ZOTUs.", "OTUs."), if(!analysis_level) {"genus."}, 
+      trans_meth, ".", dist_meth, ".pairwise_dists.png"), sep = "/"),
+         plot = p2, bg = "white", dpi = 300,
+         width = attr(p2, "plot_width"), height = attr(p2, "plot_height"))
+  
+  attr(p1, "legend") <- plot_title
+  return(p1)
+}
+
+# define all combinations of norm and dist methods
+fct_vars2 <- tidyr::expand_grid(trans_methods, dist_methods)
+# use pmap to generate all plots
+allplots2 <- pmap(fct_vars2, ~plot_pair_dists(trans_meth = ..1,
+                                              dist_meth = ..2))
+# extract fig legends
+fig_legends2 <- base::lapply(allplots2, attr, "legend")
+```
+```{r plot_pair_dist, echo = FALSE, results = 'hide', fig.dim = c(max(base::sapply(allplots2, function(x) attr(x, "plot_width"))), max(base::sapply(allplots2, function(x) attr(x, "plot_height")))), fig.cap = fig_legends2}
+allplots2
+```
+\newpage
+## Distance-based redundancy analysis (db-RDA) and taxa projection
+Distance-based redundancy analysis (db-RDA) developed by [Legendre and Anderson (1999)](https://doi.org/10.1890/0012-9615(1999)069[0001:DBRATM]2.0.CO;2) is a means to conduct RDA, a method which is intended to detect linear relationships, on (dis)similarities generated by measures which may be non-linear, such as Manhattan or Bray-Curtis distance. If called with Euclidean distance, the results are identical to RDA. A (dis)similarity matrix, calculated using a measure appropriate to the response data, is used as input to a principal coordinates analysis (PCoA). The result of this is a set of principal coordinates which represent the (dis)similarities in a Euclidean space, which is appropriate for analysis using standard RDA. The method is implemented via `dbrda`/`capscale` functions of the [`vegan`](https://cran.r-project.org/web/packages/vegan/index.html) package with a modified version of the `phyloseq_dbRDA` function available [here](https://github.com/fconstancias/DivComAnalyses/) as a wrapper. More information can be found [here](https://sites.google.com/site/mb3gustame/constrained-analyses/rda/dbrda).   
+
+Major contributing taxa can be projected onto ordination plots using the [`vegan::envfit`](https://search.r-project.org/CRAN/refmans/vegan/html/envfit.html) function. Here, a modified version of the `phyloseq_add_taxa_vector` function available [here](https://github.com/fconstancias/DivComAnalyses/) was used as a wrapper. 
+
+```{r biplot_fct}
+# devtools::install_github("fawda123/ggord")
+incProgress(1/8, message = "Plotting distance-based redundancy analysis and taxa projection...")
+
+# function to do db-RDA and plot
+phyloseq_dbRDA <- function(phylo_obj,
+                           dm,
+                           group_param_formula = var_comp_test,
+                           group_param,
+                           vec_ext = 0.2) {
+  
+  # devtools::install_github("fawda123/ggord")
+    require(ggord); require(vegan); require(broom)
+  
+  # extract and modify dist matrix
+  dist <- as.matrix(dm)[sample_names(phylo_obj),sample_names(phylo_obj)] %>%
+    as.dist()
+  
+  # extract metadata
+  metadata <- phylo_obj %>% sample_data() %>% data.frame()
+
+  ### dbRDA using vegan::capscale
+  dbRDA <- vegan::capscale(formula(paste0("dist", "~", group_param_formula)),
+                           metadata,
+                           add = TRUE)
+
+  # overall significance of the model
+  anova_all <- broom::tidy(anova(dbRDA)) %>%
+    mutate(across(where(is.numeric), round, 3))
+
+  # significance of different covariables
+  anova_terms <- broom::tidy(anova(dbRDA, by = "terms")) %>%
+    mutate(across(where(is.numeric), round, 3))
+
+  # split formula in variable components
+  splitstr <- unlist(str_split(string = group_param_formula, pattern = "[\\*,\\+]"))
+  
+  # function to modify vector labels (remove variable names)
+  change_vec_labels <- function(splitstr. = splitstr) {
+    # loop through metadata to extract variable categories
+    stre <- vector("list", length(splitstr.))
+      for(i in 1:length(splitstr.)) {
+         uc <- unique(as.character(metadata[, splitstr.[i]]))
+         uc <- paste0(splitstr.[i], uc)
+         stre[[i]] <- uc
+      }
+    # make a vector of variable combinations
+    comb <- c(unlist(stre), purrr::cross(stre) %>% map_chr(paste, sep = ":",
+                                                           collapse = ":"))
+    # combine all to a list
+    vecmod <- setNames(as.vector(
+      str_remove_all(string = comb, pattern = paste(splitstr., collapse = "|")),
+      mode = "list"), comb)
+    return(vecmod)
+  }
+  # check whether at least two CCA axes are present
+  do_plot <- (length(data.frame(dbRDA$CCA$centroids)) >= 2)
+  
+  # extract centroids
+  if(do_plot) {
+  centr <- data.frame(dbRDA$CCA$centroids[, c('CAP1', 'CAP2')]) %>%
+       rownames_to_column(var = "centroid") %>%
+    mutate(centroid = str_remove_all(centroid, paste(splitstr, collapse = "|")))}
+  
+  # biplot of the data
+  if(!is.null(group_param) & do_plot){
+    pt <- ggord::ggord(dbRDA,
+                        grp_in = metadata[,group_param],
+                        ellipse = FALSE,
+                        poly = FALSE,
+                        # repel = TRUE,
+                        vec_ext = vec_ext,
+                        alpha = 1,
+                        coord_fix = TRUE,
+                        size = 3,
+                        vec_lab = change_vec_labels(),
+                        ellipse_pro = 0.8,
+                        hull = TRUE,
+                        exp = c(0.1, 0),
+                        point.padding = 0
+                        ) +
+      guides(shape = "none") +
+      # stat_ellipse(aes(fill = metadata[,group_param],
+      #        color = metadata[,group_param]), geom = "polygon", alpha = 0.1) +
+      ord_plot_settings +
+      ggrepel::geom_text_repel(data = centr,
+                               aes(x = CAP1, y = CAP2, label = centroid),
+                               size = 3, colour = "grey70") +
+      geom_text(data = anova_all, mapping = aes(x = -Inf, y = Inf,
+                label = paste("p =", anova_all$p.value[1]), hjust = -0.1,
+                vjust = 1.5), size = 3, show.legend = FALSE)
+
+    out <- list("plot" = pt,
+                "dbRDA" = dbRDA,
+                "anova_all" = anova_all,
+                "anova_terms" = anova_terms)
+  }else{
+
+    out <- list("dbRDA" = dbRDA,
+                "anova_all" = anova_all,
+                "anova_terms" = anova_terms)
+  }
+  ### ------
+  return(out)
+  ### ------
+  detach("package:ggord", unload = TRUE)
+}
+
+# add top correlating taxa to MDS-plots
+phyloseq_add_taxa_vector <- function(dm,
+                                     phylo_obj,
+                                     figure_ord,
+                                     ord_obj,
+                                     pval_cutoff = 0.05,
+                                     top_r = 12,
+                                     taxrank_glom = "Family",
+                                     tax_rank_plot = "Family",
+                                     id_taxa = "ASV",
+                                     taxnames_rm = "unknown",
+                                     fact = 3,
+                                     seed = 42,
+                                     perm = 999,
+                                     join_cbind = "join"){
+  
+  
+  require(phyloseq); require(tidyverse); require(vegan)
+
+  dm <- as.matrix(dm)[sample_names(phylo_obj),sample_names(phylo_obj)] %>%
+        as.dist()
+
+  # Calculate ordination
+  if(is.null(ord_obj) | is.null(ord_obj$vectors)) {
+  stop("MDS / PCoA ordination required!")
+  }
+
+    phylo_obj %>%
+    transform_sample_counts(function(x) {x/sum(x)} * 100)  -> tmp1
+
+  if(taxrank_glom != FALSE) {
+    tmp1 %>%
+      tax_glom(taxrank_glom) %>% #speedyseq::tax_glom(taxrank_glom)
+      otu_table() %>%
+      t() %>%
+      data.frame() -> tmp
+  }else{
+    tmp1 %>%
+      otu_table() %>%
+      t() %>%
+      data.frame() -> tmp
+  }
+
+  set.seed(seed)
+  # this fits species vectors
+  dune.spp.fit <- envfit(ord_obj$vectors, tmp, permutations = perm) 
+
+  # save species intrinsic values into dataframe
+  spp.scrs <- as.data.frame(scores(dune.spp.fit, display = "vectors"))
+  #add species names to dataframe
+  spp.scrs <- cbind(spp.scrs, id = rownames(spp.scrs)) 
+  
+  spp.scrs <- cbind(spp.scrs, pval = dune.spp.fit$vectors$pvals,
+                    r = dune.spp.fit$vectors$r)
+  # abbreviate species names
+  # spp.scrs<- cbind(spp.scrs, abrev = abbreviate(spp.scrs$Species,
+  #                  minlength = 6)) 
+
+  as(tax_table(tmp1), "matrix") %>%
+    as.data.frame() %>%
+    rownames_to_column('ASV') -> tax_table
+
+  # join data either by 'left_join' or 'cbind'
+  # use 'left_join' to avoid issues with rownames in comb. with specific chars
+  if(join_cbind == "join"){  
+    all <- dplyr::left_join(spp.scrs,
+              tax_table,
+              by = c("id" = id_taxa))
+  }
+  if(join_cbind == "cbind"){
+    all <- cbind(spp.scrs, tax_table)
+  }
+  
+  all <- all %>%
+      dplyr::rename(tax_rank_plot = all_of(tax_rank_plot)) %>%
+      dplyr::filter(!tax_rank_plot %in% taxnames_rm,
+                    pval < pval_cutoff) %>%
+      slice_max(r, n = top_r)
+
+  pt <- figure_ord  +
+        #add vector arrows of significant species
+        geom_segment(data = all,
+                     aes(x = 0, xend = Axis.1* fact, y = 0, yend=Axis.2 * fact),
+                     arrow = arrow(length = unit(0.25, "cm")),
+                     colour = "grey10", lwd=0.3, inherit.aes = FALSE) +
+        #add labels
+        ggrepel::geom_text_repel(data = all,
+         aes(x= Axis.1*fact, y = Axis.2*fact, label = tax_rank_plot),
+         size = 3, direction = "both", segment.size = 0.25, inherit.aes = FALSE)
+
+  out <- list(
+    "plot" = pt,
+    "envfit" = all %>%
+      dplyr::select(!! taxrank_glom := tax_rank_plot, R2 = r, p.value = pval) %>%
+      mutate(across(where(is.numeric), round, 3))
+             )
+  return(out)
+}
+```
+
+```{r biplot_loop, echo = FALSE}
+
+# function to plot biplots
+biplots <- function(trans_meth, dist_meth, group_param = var_test, tax_level, top_r) {
+  require(ggpubr)
+  
+  ## dbRDA
+  # generate plot title
+  plot_title1 <- paste(
+    "Distance-based redundancy analysis (db-RDA) on", dist_names[dist_meth], "distance of\n",
+    trans_names[trans_meth] , ifelse(analysis_level, ifelse(
+      TU_type, "ZOTUs/ASVs", "OTUs"), paste0(
+        "genus (based on ", ifelse(TU_type, "ZOTUs/ASVs", "OTUs"), ")")), "count data")
+  
+  # calculate biplot 1
+  out1 <- phyloseq_dbRDA(
+    phylo_obj = transform_list[[trans_meth]],
+    dm = dists[[trans_meth]][[dist_meth]], # distance matrix
+    group_param = group_param)
+
+  if("plot" %in% names(out1)) {
+    p1 <- out1$plot +
+      ggtitle(plot_title1) +
+      theme(plot.title = element_text(hjust = 0.5),
+            legend.text = element_markdown())
+    p1 <- fix_ggplot_panel(p = ggplotify::as.ggplot(p1), p.margin = 20, p.width = 14)
+  
+    ggsave(filename = paste(
+      output_dir7, paste0(
+        ifelse(TU_type, "ZOTUs.", "OTUs."), if(!analysis_level) {"genus."},
+        trans_meth, ".", dist_meth, ".dbRDA.png"), sep = "/"),
+           plot = p1, bg = "white", dpi = 300,
+           width = attr(p1, "plot_width"), height = attr(p1, "plot_height"))
+  }
+  
+  p2 <- ggpubr::ggtexttable(out1$anova_terms, rows = NULL,
+                            theme = ggpubr::ttheme(base_style = "default",
+                                                   base_size = 8))
+  
+  ## add top correlated taxa to MDS / PCoA plot
+  # generate plot title
+  plot_title2 <- paste(
+    "Principal coordinate analysis (PCoA) on", dist_names[dist_meth], "distance of\n",
+    trans_names[trans_meth] , analysis_level, "count data with\n", top_r, tax_level,
+       "taxa projected.")
+
+  # calculate biplot 2
+  out2 <- phyloseq_add_taxa_vector(
+      phylo_obj = transform_list[[trans_meth]],
+      dm = dists[[trans_meth]][[dist_meth]],
+      ord_obj = ord.all[[trans_meth]][[paste("MDS", dist_meth, sep = ".")]], 
+      join_cbind = "join",
+      figure_ord = allplots[[paste(trans_meth, dist_meth, "MDS", sep = ".")]], 
+      fact = 0.25,
+      pval_cutoff = 0.05,
+      top_r = top_r,
+      taxrank_glom = tax_level,
+      tax_rank_plot = tax_level
+  )
+  p3 <- out2$plot + ggtitle(plot_title2)
+  p3 <- fix_ggplot_panel(p = p3, p.margin = 20, p.width = 14)
+
+  ggsave(filename = paste(
+    output_dir7, paste0(
+      ifelse(TU_type, "ZOTUs.", "OTUs."),  if(!analysis_level) {"genus."},
+      trans_meth, ".", dist_meth, ".PCoA_taxa.png"), sep = "/"),
+    plot = p3, bg = "white", dpi = 300, 
+    width = attr(p3, "plot_width"), height = attr(p3, "plot_height"))
+  
+  p4 <- ggpubr::ggtexttable(out2$envfit, rows = NULL,
+                            theme = ggpubr::ttheme(base_style = "default",
+                                                   base_size = 8))
+  
+  # combine the two plots using ggarrange
+  plot_legend <- paste(
+    if("plot" %in% names(out1)) {paste(
+      "(A) Distance-based redundancy analysis (db-RDA) on",
+       dist_names[dist_meth], "distance of", trans_names[trans_meth] , ifelse(analysis_level, ifelse(TU_type, "ZOTUs/ASVs", "OTUs"), paste0(
+        "genus (based on ", ifelse(TU_type, "ZOTUs/ASVs", "OTUs"), ")")),
+       "count data. Variable vectors are labeled in black and centroids in grey. The p-value in the upper left corner is the overall ANOVA result of the model.") 
+    } else {"(A) Less than two CCA axes - no plot!"},
+    paste("(B) Results of ANOVA testing the influence (statistics) of each of the covariables (via 'terms'). (C) Principal coordinate analysis (PCoA) on",
+          dist_names[dist_meth], "distance of", trans_names[trans_meth],
+          ifelse(analysis_level, ifelse(TU_type, "ZOTUs/ASVs", "OTUs"), paste0("genus (based on ", ifelse(TU_type, "ZOTUs/ASVs", "OTUs"), ")")),
+          "count data is shown with top", top_r, tax_level,
+          "taxa projected using the 'envfit' function of the 'vegan' package. In (D) the statistics of the taxa depicted in (C) are shown. The column 'R2' is a measure of the correlation of the respective taxon with the variable(s) analyzed.")
+  )
+  
+  # arrange plots
+  patch <- ggpubr::ggarrange(
+    if("plot" %in% names(out1)){out1$plot} else {patchwork::plot_spacer()},
+    out2$plot + ggtitle(""), ncol = 2, common.legend = TRUE,
+    legend = "bottom", align = "hv", labels = c("A", "C"))
+  patch1 <- ggpubr::ggarrange(p2, p4, ncol = 2, align = "h", labels = c("B", "D"))
+  patch2 <- ggpubr::ggarrange(patch, patch1, nrow = 2, heights = c(1.5, 1))
+
+  attr(patch2, "legend") <- plot_legend
+  return(patch2)
+}
+
+# use pmap to generate all plots
+allplots3 <- pmap(fct_vars2, ~biplots(trans_meth = ..1,
+                                      dist_meth = ..2,
+                                      tax_level = "Family",
+                                      top_r = 10))
+
+# # extract fig legends
+fig_legends3 <- base::lapply(allplots3, attr, "legend")
+```
+```{r plot_biplots, echo = FALSE, results = 'hide', fig.dim = c(8, 8), out.height = "75%", fig.cap = fig_legends3}
+allplots3
+```
+\newpage
+## Calculate statistics of beta diversity
+Permutational multivariate analysis of variance (PERMANOVA) as implemented in the `adonis2` function of the [`vegan`](https://cran.r-project.org/web/packages/vegan/index.html) package is used to test for different composition of all groups. A pairwise variant of the `adonis2` function as implemented in the [`pairwiseAdonis`](https://github.com/pmartinezarbizu/pairwiseAdonis) package is used to compare the individual groups with each other.
+
+### Test for variance homoscedasticity
+Because PERMANOVA assumes that dispersion of the data in the groups is similar (variance homoscedasticity), this is tested using the `betadisper` function with subsequent `permutest` (see [here](http://thebiobucket.blogspot.com/2011/04/assumptions-for-permanova-with-adonis.html)). As an alternative to the classical comparison of group dispersions, Tukey's Honest Significant Differences are calculated between groups using the `TukeyHSD` function of the `stats` package on the `betadisper` results.
+
+```{r calc_beta_stats}
+# vector of names for statistical tests
+incProgress(1/8, message = "Calculating beta diversity statistics...")
+stat_tests <- c("betadisp_perm", "Tukey_betadisp",
+                "adonis", "adonis_alt", "adonis_pair")
+
+# function to calculate all beta diversity stats
+calc_beta_stats <- function(nmeth = trans_methods,
+                            dmeth = dist_methods,
+                            group_param = var_test,
+                            group_param_formula = var_comp_test) {
+  
+  # function to calculate all beta diversity stats
+  phylo_beta_stats <- function(phylo_obj, dm,
+                               group_param.. = group_param.,
+                               group_param_formula.. = group_param_formula.,
+                               nmeth.. = nmeth., dmeth.. = dmeth.) {
+      require(vegan); require(phyloseq)
+      set.seed(42)
+      # process distance matrix
+      dm <- as.matrix(dm)[sample_names(phylo_obj),sample_names(phylo_obj)] %>%
+            as.dist()
+      # get metadata
+      meta <- data.frame(sample_data(phylo_obj))
+      
+      # calculate betadispersion
+      b <- vegan::betadisper(dm, get_variable(phylo_obj, group_param..))
+      
+      # do permutest on betadisper result
+      permtest <- vegan::permutest(b, pairwise = TRUE, permutations = 1000)
+      permtest_df <- permtest$tab
+      # extract p value of permutest result
+      pval_permutest <- permtest_df$`Pr(>F)`[1]
+    
+      # do TukeyHSD on betadisper result
+      tukey_betadisp <- tidy(TukeyHSD(b))
+      
+      # define formula for adonis2 test
+      f <- as.formula(paste("dm", group_param.., sep = " ~ "))
+      f2 <- as.formula(paste("dm", group_param_formula.., sep = " ~ "))
+    
+      # apply adonis2 function with dist objects and metadata
+      ad2 <- tidy(adonis2(f, data = meta, perm = 1000))
+      ad2_alt <- tidy(adonis2(f2, data = meta, perm = 1000))
+      pval_adonis <- pull(ad2[1, "p.value"])
+    
+      # apply pairwise adonis2 function
+      ad2_pair <- pairwise.adonis(dm, get_variable(phylo_obj, group_param..))
+            
+      # extract betadisp/permutest results and export as df
+      df <- data.frame(
+        group = b$group,
+        distance = b$distances) %>%
+        mutate(
+          group = factor(group,
+                         levels = levels(get_variable(phylo_obj, group_param..))),
+          trans_meth = nmeth..,
+          dist_meth = dmeth..,
+          pval_permutest = pval_permutest,
+          pval_adonis = pval_adonis) %>%
+        rownames_to_column(var = "sample_ID")
+      
+      # combine all results for export
+      res <- list(
+                  permtest_df,
+                  tukey_betadisp,
+                  ad2,
+                  ad2_alt,
+                  ad2_pair,
+                  df
+                 )
+      # adjust list names
+      names(res) <- paste(paste(nmeth.., dmeth.., sep = "_"),
+                          c(stat_tests, "pt_df"), sep = "_")
+      return(res)
+  }
+   
+  # function to loop over parameters
+  batch_beta_stats <- function(nmeth. = nmeth, dmeth. = dmeth,
+                               group_param. = group_param,
+                               group_param_formula. = group_param_formula) {
+    
+    out <- phylo_beta_stats(
+     phylo_obj = transform_list[[nmeth.]],
+     dm = dists[[nmeth.]][[dmeth.]], # distance matrix
+     group_param.. = group_param.,
+     group_param_formula.. = group_param_formula.,
+     nmeth.. = nmeth.,
+     dmeth.. = dmeth.
+   )
+  return(out)
+  }
+  
+  # define all combinations of norm and dist methods
+  fct_vars <- tidyr::expand_grid(nmeth, dmeth)
+  # use pmap to generate all df
+  allbeta <- pmap(fct_vars, ~batch_beta_stats(nmeth. = ..1,
+                                              dmeth. = ..2)) %>%
+    purrr::flatten()
+
+  # extract data for plotting
+  alldists <- allbeta %>%
+    keep(str_detect(names(.), '_pt_df')) %>%
+    bind_rows() %>%
+    mutate(trans_dist = paste(
+      dist_names[dist_meth], "distance of\n", trans_names[trans_meth], "counts"
+    ))
+  
+  pval_df <- distinct(alldists, pval_permutest, pval_adonis, trans_dist) %>%
+    mutate(pval_permutest = ifelse(pval_permutest < 0.001,
+                                   "p (betadisp) < 0.001",
+                                   paste("p (betadisp) =", round(pval_permutest, 3))),
+           pval_adonis = ifelse(pval_adonis < 0.001,
+                                "p (adonis) < 0.001",
+                                paste("p (adonis) =", round(pval_adonis, 3))),
+           pval = paste(pval_permutest, pval_adonis, sep = "\n"))
+  
+  # plot the data as faceted ggplot
+  pt <- ggplot(alldists, aes(x = group, y = distance)) +
+    geom_jitter(aes(color = "black"), alpha = 0.1) +
+    geom_boxplot(aes(color = "black"), fill = NA, outlier.shape = NA,
+                 outlier.colour = NA) +
+    scale_color_identity() +
+    scale_x_discrete(labels = label_set) +
+    # expand y axis by 20% to accomodate p-values
+    scale_y_continuous(expand = expansion(mult = c(0, 0.20))) +
+    # https://ggplot2.tidyverse.org/articles/faq-faceting.html
+    facet_wrap(vars(trans_dist),
+      labeller = labeller(trans_dist = 
+        label_wrap_gen(width = length(base::unique(alldists$group))*7))) +
+    geom_text(data = pval_df, mapping = aes(x = -Inf, y = Inf, label = pval,
+              hjust = -0.1, vjust = 1.3), size = 3, show.legend = FALSE) +
+    egg::theme_article() +
+    ylab("Distance to centroid") + xlab(NULL) +
+    theme(axis.text.x = element_markdown(angle = 45, hjust = 1, vjust = 1),
+          plot.title = element_markdown(hjust = 0.5))
+    
+  # adjust plot sizes
+  p.width. <- length(base::unique(alldists$group)) + 0.5
+  pt <- fix_ggplot_panel(p = pt, p.margin = 10, p.width = p.width., p.height = 6)
+
+  # return list
+  return(list(
+    "plot" = pt,
+    "data" = allbeta %>%
+             keep(str_detect(names(.), '_pt_df', negate = TRUE))
+  ))
+}
+
+# calculate all beta diversity stats and do plotting of distances
+beta_stats <- calc_beta_stats()
+```
+```{r, echo = FALSE}
+# summarize similar tests into one df
+summarise_beta <- function(l) {
+  sum_list <- setNames(vector("list", length(stat_tests)),
+                             c(stat_tests))
+  for (i in stat_tests) {
+  sum_list[[i]] <- bind_rows(l[c(str_detect(
+    string = names(l), pattern = paste0(i, "$")))],
+    .id = "measure") }
+  return(sum_list)
+}
+adonis_tests_sum <- summarise_beta(beta_stats[["data"]])
+```
+```{r plot_betadisp, echo = FALSE, fig.dim = c(attr(beta_stats[["plot"]], "plot_width")+1, attr(beta_stats[["plot"]], "plot_height")), fig.cap = "Distance of individual samples to the respective cluster centroid. Variation of samples within clusters (dispersion) was tested using betadisp. The p (betadisp) value is the result of a subsequent permutest analysis and should be >0.05 for non-significant differences in dispersion. The p (anova) value is the result of an ANOVA analysis testing for significant differences between clusters and assumes non-significant differences in dispersion."}
+beta_stats[["plot"]]
+```
+```{r pairwise_diff, echo = FALSE}
+incProgress(1/8, message = "Plotting beta dispersion...")
+# prepare df for summary table
+sig_pairwise <- adonis_tests_sum[["adonis_pair"]] %>%
+  mutate(measure = str_remove(measure, "_adonis_pair")) %>%
+  
+  # combine with results from betadispersion/permutest 
+  dplyr::left_join(
+    mutate(adonis_tests_sum[["betadisp_perm"]],
+           measure = str_remove(measure, "_betadisp_perm")) %>%
+    dplyr::select(measure, F_betadisp = `Pr(>F)`) %>%
+    dplyr::filter(!is.na(F_betadisp)), by = "measure") %>%
+  
+  # filter for significant results
+  dplyr::filter(p.adjusted < 0.05 & F_betadisp >= 0.05) %>%
+  tidyr::separate(measure, c("trans_method", "dist_method")) %>%
+  mutate(trans_method = str_remove_all(trans_names[trans_method], "-transformed"),
+         dist_method = dist_names[dist_method],
+         pairs = str_replace_all(pairs, " vs ", " vs. ")) %>%
+  dplyr::select(-sig, -F_betadisp, -Df, -SumsOfSqs) %>%
+  arrange(p.adjusted, dplyr::desc(R2))
+```
+\newpage
+### Significant pairwise comparisons
+`r ifelse(nrow(sig_pairwise) > 0, "The top significant results of [pairwiseAdonis](https://github.com/pmartinezarbizu/pairwiseAdonis) are shown for different group comparisons with similar beta dispersion (variance homoscedasticity).", "There were **no significant differences** between groups of similar beta dispersion (variance homoscedasticity) using [pairwiseAdonis](https://github.com/pmartinezarbizu/pairwiseAdonis).")`
+```{r summary_table, eval = nrow(sig_pairwise) > 0, echo = FALSE}
+# display summary df using kable
+# using captions in combination with kable_style position options requires to escape '_' with '\\'
+ kbl(head(sig_pairwise, 10), caption = paste("Results of pairwise comparisons (pairs) using PERMANOVA (adonis2 function) are shown for combinations of transformation (trans\\_method) and distance matrix calculation methods (dist\\_methods).",
+ if(nrow(sig_pairwise) > 10) "The 10 comparisons with lowest adjusted p value (p.adjusted) and highest correlation (R2) are shown."),
+ booktabs = TRUE, linesep = "", digits = 3, format.args = list(big.mark = ",")) %>%
+ kable_styling(latex_options = c("striped", "HOLD_position", "scale_down"))
+incProgress(0.1, message = "Saving...")
+```
+### Export all results
+```{r excel_export}
+# file name for Excel file
+Excel_file <- paste0(ifelse(TU_type, "ZOTUs", "OTUs"), if(!analysis_level){"_genus"},
+                     "_beta_diversity_stats_", var_test, ".xlsx")
+# export ANOVA analyses to Excel
+writexl::write_xlsx(adonis_tests_sum,
+         path = paste(output_dir7, Excel_file, sep = "/"))
+```
+More detailed statistical analyses can be found in the corresponding exported Excel file:<br>
+
+``r Excel_file``
+
+## Record session information
+\tiny
+```{r session_info, echo = FALSE}
+print(sessionInfo())
+```

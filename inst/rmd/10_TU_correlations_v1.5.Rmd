@@ -1,0 +1,302 @@
+---
+title: "Calculate correlations between TUs and independent meta variables"
+author: "Jesika Kotorri"
+date: "`r format(Sys.time(), '%d.%m.%y')`"
+header-includes:
+- \usepackage{float} #use the 'float' package
+- \floatplacement{figure}{H} #make every figure with caption = h
+- \usepackage{flafter}
+- \usepackage{booktabs}
+- \usepackage{longtable}
+- \usepackage{array}
+- \usepackage{multirow}
+- \usepackage{wrapfig}
+- \usepackage{colortbl}
+- \usepackage{pdflscape}
+- \usepackage{tabu}
+- \usepackage{threeparttable}
+- \usepackage{threeparttablex}
+- \usepackage[normalem]{ulem}
+- \usepackage{makecell}
+- \usepackage{xcolor}
+output: pdf_document
+params:
+  workdir:
+    label: "working directory"
+    value: "U:/00_Shiny/Test"
+  TU_type:
+    label: "type of taxonomic units"
+    value: NULL
+  meta_file:
+    label: "path to metadata file (rds format)"
+    value: NULL
+  tu_table:
+    label: "path to TU table"
+    value: NULL
+  abundance_cutoff:
+    label: "absolute abundance cutoff"
+    value: NULL
+  prevalence_cutoff:
+    label: "TU prevalence cutoff"
+    value: NULL
+  support_cutoff:
+    label: "effect-size cutoff"
+    value: NULL
+  pval_cutoff:
+    label: "p-value cutoff"
+    value: NULL
+  r_cutoff:
+    label: "correlation coefficient cutoff"
+    value: NULL
+fontsize: 10pt
+urlcolor: blue
+papersize: a4
+    
+---
+
+```{r setup, include=FALSE}
+script_version <- "1.5"
+```
+This is 'calculate correlations between TUs and independent meta variables' script version **`r script_version`** by Jesika Kotorri
+
+## Load required libraries
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(ggh4x)
+library(corrplot)
+library(readxl)
+library(phyloseq)
+library(rmarkdown)
+library(pander)
+library(tibble)
+library(stringr)
+library(tidyr)
+library(readr)
+```
+
+```{r global_options, echo = FALSE}
+# Set up global figure options for uniform figures:
+knitr::opts_chunk$set(fig.width = 7, fig.align = "center", out.extra = "",
+                      warning = FALSE, message = FALSE, fig.pos = "!H",
+                      dev = "cairo_pdf",
+                      cache.path = params$workdir)
+options(knitr.kable.NA = '')
+```
+```{r general_variables, echo = FALSE}
+# setting TU type
+TU_type <- ifelse(params$TU_type == "OTU", FALSE, TRUE)
+```
+## Setting up environment parameters
+Type of importet taxonomic units (TUs)
+`r ifelse(params$TU_type == "OTU", paste0("Taxonomic data is present in the form of **OTUs** (Operational Taxonomic Units)"), paste0("Taxonomic data is present in the form of **ZOTUs/ASVs** (Zero-radius Operational Taxonomic Units/Amplicon Sequence Variants)"))`
+
+
+Filter options:
+
+* abundance_cutoff: **`r pander::pander(params$abundance_cutoff)`**
+* prevalence_cutoff: **`r pander::pander(params$prevalence_cutoff)`**
+* support_cutoff: **`r pander::pander(params$support_cutoff)`**
+* pval_cutoff: **`r pander::pander(params$pval_cutoff)`**
+* r_cutoff: **`r pander::pander(params$r_cutoff)`**
+
+Define file paths:
+
+* meta_file: **`r pander::pander(params$meta_file)`**
+
+## Import taxonomic classifications from the phyloseq object
+```{r import_phyloseq}
+# import phyloseq object
+physeq_object <- readRDS(ifelse(TU_type, 
+  input$uploadZOTUphyseq$datapath, input$uploadOTUphyseq$datapath))
+phyloseq_data <- physeq_object[["no_ambig_euk"]]
+```
+
+<!-- # ```{r debugging, echo = FALSE} -->
+<!-- # params <- list( -->
+<!-- #   TU_type = "OTU", -->
+<!-- #   workdir = "O:/04_projects_NGS/Vieth/run_01/05_bioinformatics/07_TW_Binder", -->
+<!-- #   meta_file <- "../00_metadata/meta_TW_Binder.rds" -->
+<!-- # ) -->
+<!-- # # workdir <-  -->
+<!-- # # TU_type <- FALSE -->
+<!-- # # meta_file <- "../00_metadata/meta_TW_Binder.rds" -->
+<!-- # ``` -->
+## Load required tables
+```{r load_tables}
+# import meta data
+meta <- readRDS(
+  params$meta_file) %>%
+  dplyr::filter(samp_ctrl != "neg_ctrl")
+#meta <- as.data.frame(sample_data(phyloseq_data))
+# import TU count table
+tu_table <- as.data.frame(phyloseq::otu_table(phyloseq_data))
+# import taxonomic classifications
+tax <- as.data.frame(phyloseq::tax_table(phyloseq_data)) %>%
+  tibble::rownames_to_column(var = ifelse(TU_type, "Zotu", "OTU"))
+# filter out independent variables from meta file
+meta_independent <- dplyr::select(meta, where(is.numeric))
+```
+## Calculating correlations
+```{r calculate_corr}
+# sum TU counts in every sample
+count_sum_per_sample <- colSums(tu_table)
+# calculate the relative abundance of TUs by dividing each count in a sample by the 
+#total TU sum in a sample and multiply by 100
+rel_tu <- sweep(tu_table, 2, count_sum_per_sample, FUN = function(x, y) (x / y))
+# set an abundance cutoff that turns TUs with an abundance below the cutoff within a 
+#sample to 0
+# abundance_cutoff <- 0.5
+#abundance_cutoff <- params$abundance_cutoff
+# apply abundance filter
+filtered_rel_tu <- rel_tu %>%
+  dplyr::mutate_if(is.numeric,
+            ~case_when(. * 100/ sum(.) < params$abundance_cutoff ~ 0,
+                       T ~ .)) %>%
+  dplyr::filter(rowSums(across(where(is.numeric)))!=0) # remove TUs with 0 abundance across 
+  #all samples
+
+# set a prevalence cutoff that removes TUs with an abundance below the cutoff across 
+#all samples
+prevalence_cutoff <- 0.3
+# function to check for non zeroes
+nonzero <- function(x) sum(x != 0)
+# apply prevalence filter
+filtered_rel_tu1 <- filtered_rel_tu %>%
+  tibble::rownames_to_column() %>%
+  rowwise() %>%
+  dplyr::mutate(prevalence_ratio = 
+           nonzero(c_across(where(is.numeric))) / length(c_across(where(is.numeric)))) %>%
+  dplyr::filter(prevalence_ratio > params$prevalence_cutoff) %>%
+  ungroup() %>%
+  dplyr::select(-prevalence_ratio) %>%
+  tibble::column_to_rownames(var = "rowname")
+# turn samples to rownames and TUs to column names
+filtered_rel_tu2 <- as.data.frame(t(filtered_rel_tu1))
+# replace 0 with NAs
+filtered_rel_tu3 <- filtered_rel_tu2 %>%
+  dplyr::mutate(across(everything(), ~ if_else(. == 0, NA, .)))
+# function to clr transform your data
+clr_transform <- function(x) {
+  x %>%
+    log() %>%
+    dplyr::mutate_all(~ . - log(exp(mean(., na.rm = TRUE))))
+}
+# apply clr transformation on your data
+trans_rel_tu <- clr_transform(filtered_rel_tu3)
+# combine independent variables with the clr transformed TUs
+tu_combined <- base::cbind(meta_independent, trans_rel_tu)
+# scale the combined table
+tu_combined_scaled <- as.data.frame(scale(tu_combined, center = TRUE, scale = TRUE))
+# create a correlation matrix
+require(Hmisc)
+tu_corr <- Hmisc::rcorr(as.matrix(tu_combined_scaled), type = "pearson")
+# put correlations, pvalues and support in seperate objects
+pull_corr_results <- function(data) {
+  as.data.frame(data) #%>%
+    #rownames_to_column() %>%
+    #dplyr::rename_with(~"", .cols = 1)
+}
+tu_correlations <- pull_corr_results(tu_corr$r)
+tu_pvals <- pull_corr_results(tu_corr$P)
+tu_support <- pull_corr_results(tu_corr$n)
+
+tu_correlations <- as.data.frame(tu_corr$r) %>%
+  tibble::rownames_to_column()
+colnames(tu_correlations)[1] <- ""
+
+tu_pvals <- as.data.frame(tu_corr$P) %>%
+  tibble::rownames_to_column()
+colnames(tu_pvals)[1] <- ""
+
+tu_support <- as.data.frame(tu_corr$n) %>%
+  tibble::rownames_to_column()
+colnames(tu_support)[1] <- ""
+```
+## Clean correlation matrix
+```{r clean_matrix}
+# join unfiltered relative TU table and taxonomic classifications
+rel_tu1 <- tibble::rownames_to_column(rel_tu, var = ifelse(TU_type, "Zotu", "OTU"))
+joined <- dplyr::left_join(rel_tu1, tax, by = ifelse(TU_type, "Zotu", "OTU"))
+# add unknown_ prefix and the TU identifier to undefined taxa and kpcofgs_ prefixes to 
+#indicate the taxonomic level
+rel_tu_tax <- joined %>%
+  dplyr::mutate(
+    Phylum = ifelse(is.na(Phylum), paste0("unknown_", Kingdom), Phylum),
+    Class = ifelse(is.na(Class), ifelse(str_detect(Phylum, "unknown_"), Phylum, 
+                                        paste0("unknown_", Phylum)), Class),
+    Order = ifelse(is.na(Order), ifelse(str_detect(Class, "unknown_"), Class, 
+                                        paste0("unknown_", Class)), Order),
+    Family = ifelse(is.na(Family), ifelse(str_detect(Order, "unknown_"), Order, 
+                                          paste0("unknown_", Order)), Family),
+    Genus = ifelse(is.na(Genus), ifelse(str_detect(Family, "unknown_"), Family, 
+                                        paste0("unknown_", Family)), Genus),
+    Species = ifelse(is.na(Species), ifelse(str_detect(Genus, "unknown_"), 
+                                        paste(Genus, "sp."), paste0("unknown_", 
+                                        Genus, " sp.")), paste(Genus, Species)),
+    Kingdom = paste0("k_", Kingdom),
+    Phylum = paste0("p_", Phylum),
+    Class = paste0("c_", Class),
+    Order = paste0("o_", Order),
+    Family = paste0("f_", Family),
+    Genus = paste0("g_", Genus),
+    Species = paste0("s_", Species),
+    across(everything(), ~ ifelse(stringr::str_detect(., "unknown"), paste0(., " ", ifelse(TU_type, .data$Zotu, .data$OTU)), .)))
+
+# remove correlation results between TUs and only leave the ones between independent 
+#variables and TUs
+format_table <- function(data, table_name) {
+  names(data)[1] <- "parameter"
+  value <- case_when(
+    table_name == "tu_correlations" ~ "correlation",
+    table_name == "tu_pvals" ~ "pvalue",
+    table_name == "tu_support" ~ "support"
+  )
+  data <- data %>%
+  dplyr::filter(!str_detect(parameter, ifelse(TU_type, "^Zotu", "^OTU"))) %>%
+    dplyr::select(-one_of(.$parameter)) %>%
+    tidyr::pivot_longer(-parameter, names_to = ifelse(TU_type, "Zotu", "OTU"), values_to = value)
+}
+# format each correlation result table
+# for pvalue table
+tu_pvals1 <- format_table(tu_pvals, "tu_pvals")
+# for support table
+tu_support1 <- format_table(tu_support, "tu_support")
+# for correlation table
+tu_correlations1 <- format_table(tu_correlations, "tu_correlations")
+
+# aggregate the tables into one table
+input <- tu_correlations1 %>%
+  dplyr::left_join(tu_support1, by = c(ifelse(TU_type, "Zotu", "OTU"), "parameter")) %>%
+  dplyr::left_join(tu_pvals1, by = c(ifelse(TU_type, "Zotu", "OTU"), "parameter")) %>%
+  dplyr::filter(parameter != "quant_reading") %>%
+  dplyr::filter(support >= params$support_cutoff, 
+                pvalue <= params$pval_cutoff,
+                correlation >= abs(params$r_cutoff)) %>% #pvalue <= 0.05
+  mutate(p_adj = round(p.adjust(.$pvalue, method = "BH"), 4)) #adjust pvalue for multiple 
+  #testing with Benjamin Hochberg Method
+tax_info <- rel_tu_tax %>%
+  dplyr::select(!!sym(if (TU_type) "Zotu" else "OTU"), Kingdom, Phylum, Class, Order, Family, Genus, Species) %>%
+  dplyr::mutate(across(everything(), ~ str_remove(., "^[kpcofgs]_"))) %>%
+  dplyr::left_join(input, ., by = ifelse(TU_type, "Zotu", "OTU")) %>%
+  dplyr::select(!!sym(if (TU_type) "Zotu" else "OTU"), Kingdom, Phylum, Class, Order, Family, Genus, Species)
+
+# retrieve taxonomic information
+# tax_info <- rel_tu_tax %>%
+#  dplyr::select(OTU, Kingdom, Phylum, Class, Order, Family, Genus, Species) %>%
+#   mutate(across(everything(), ~ str_remove(., "^[kpcofgs]_"))) %>%
+#   dplyr::filter(., OTU %in% unique(input$OTU))
+```
+## Export the filtered correlation matrix
+```{r save_data}
+write_tsv(input, paste0(output_dir10, "/correlation_results", "_", ifelse(TU_type, "ZOTU", "OTU"), ".tab"))
+write_tsv(tax_info, paste0(output_dir10, "/taxonomic_info", "_", ifelse(TU_type, "ZOTU", "OTU"), ".tab"))
+```
+
+\newpage
+## Record session information
+\tiny
+```{r session_info, echo = FALSE}
+print(sessionInfo())
+```

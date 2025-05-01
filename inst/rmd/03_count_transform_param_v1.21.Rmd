@@ -1,0 +1,320 @@
+---
+title: "Count transformation"
+author: "`r params$author`"
+date: "`r format(Sys.time(), '%d.%m.%y')`"
+header-includes:
+- \usepackage{float} #use the 'float' package
+- \floatplacement{figure}{H} #make every figure with caption = h
+- \usepackage{flafter}
+- \usepackage{booktabs}
+- \usepackage{longtable}
+- \usepackage{array}
+- \usepackage{multirow}
+- \usepackage{wrapfig}
+- \usepackage{colortbl}
+- \usepackage{pdflscape}
+- \usepackage{tabu}
+- \usepackage{threeparttable}
+- \usepackage{threeparttablex}
+- \usepackage[normalem]{ulem}
+- \usepackage{makecell}
+- \usepackage{xcolor}
+output:
+  pdf_document:
+    latex_engine: lualatex
+    fig_width: 18
+    fig_height: 21
+    fig_caption: yes
+    df_print: kable
+    extra_dependencies: ["float"]
+    includes:
+      in_header: header.tex
+  word_document: default
+  html_document:
+    df_print: kable
+    theme: cerulean
+    highlight: haddock
+    toc: yes
+    toc_depth: 3
+    toc_float: TRUE
+    collapsed: FALSE
+    smooth_scroll: TRUE
+    code_fold: show
+params:
+  author:
+    label: "author of the analysis"
+    value: "no author given"
+  workdir:
+    label: "working directory"
+    value: "U:/00_Shiny/Test"
+  TU_type:
+    label: "type of taxonomic units analyzed"
+    value: "OTU"
+  var_test:
+    label: "metadata variable used for plotting"
+    value: NULL
+  var_name:
+    label: "variable name for plotting"
+    value: NULL
+fontsize: 10pt
+urlcolor: blue
+papersize: a4
+editor_options: 
+  chunk_output_type: console
+---
+```{r version, echo = FALSE}
+script_version <- "1.21"
+#script_date <- file.info("C:\\MyFolder\\test.csv")$mtime
+```
+This is 'Count transformation' script version **`r script_version`** by Dr. Roman Gerlach.
+
+## Load required libraries
+```{r libraries, warning = FALSE, message = FALSE}
+setProgress(1/8, message = "Loading required libraries...")
+library(tidyverse)
+library(phyloseq)
+library(vegan)
+library(microbiome) #CLR / ALR / Z transformation
+library(egg)
+library(edgeR)
+library(vsn)
+library(rmarkdown)
+library(pander)
+```
+
+```{r global_options, echo = FALSE}
+# Set up global options for nice reports and keeping figures:
+knitr::opts_chunk$set(fig.width = 18, fig.height = 21, fig.align = "center", 
+                      warning = FALSE, message = FALSE, fig.pos = "!H",
+                      out.extra = "", cache.path = params$workdir,
+                      dev = "cairo_pdf")
+options(knitr.kable.NA = '')
+```
+
+## Setting up environment and script parameters
+```{r environment, echo = FALSE}
+# setting TU type
+TU_type <- ifelse(params$TU_type == "OTU", FALSE, TRUE)
+set.seed(42)
+```
+```{r plot_parameters, echo = FALSE}
+var_test <- params$var_test
+var_name <- params$var_name
+```
+Type of imported taxonomic units (TUs)
+`r ifelse(params$TU_type == "OTU", paste0("Taxonomic data is present in the form of **OTUs** (Operational Taxonomic Units)"), paste0("Taxonomic data is present in the form of **ZOTUs/ASVs** (Zero-radius Operational Taxonomic Units/Amplicon Sequence Variants)"))`
+
+Set variables for plotting:
+
+* var_test    = **`r pander::pander(var_test)`**
+* var_name    = **`r pander::pander(var_name)`**
+
+\newpage
+## Do count transformation of data stored in phyloseq objects
+Different data characteristics require different normalization and microbial differential abundance strategies. See [this manuscript](https://microbiomejournal.biomedcentral.com/articles/10.1186/s40168-017-0237-y). Subsequent ordination methods work best for data that generally has the same range of variance at different ranges of the mean values When the expected amount of variance is approximately the same across different mean values, the data is said to be *homoskedastic*. 
+
+For subsequent ordination, normalization methods must not produce any negative values. Rlog, CLR and VST return log2-like values so negative values (normalized count below 1) are normal for very sparse data sets. Therefore, these transformations may not be optimal for this kind of data. Two modified versions of CLR (centered log-ratio) transformation as implemented in [seurat](https://github.com/satijalab/seurat/issues/2624) produce strictly non-negative values.
+
+```{r count_transform}
+incProgress(1/8, message = "Transform data...")
+Sys.sleep(2)
+
+# import list of phyloseq objects from file
+physeq_list <- readRDS(ifelse(TU_type, input$uploadZOTUphyseq$datapath, input$uploadOTUphyseq$datapath))
+
+# define filtering step for further analyses
+# OTU data after outlier sample removal:
+physeq.data.otus <- physeq_list[["no_ambig_euk"]]
+# genus data:
+physeq.data.genus <- physeq_list[["genus_aggl"]]
+
+# function for relative log expression (RLE) normalization
+RLE_normalization <- function(physeq){
+  prior.count = 1
+  count_scale = median(sample_sums(physeq))
+  m = as(otu_table(physeq), "matrix")
+  m <- m + 0.001
+  d = DGEList(counts = m, remove.zeros = FALSE)
+  z = edgeR::calcNormFactors(d, method = "RLE")
+  y <- as.matrix(z)
+  lib.size <- z$samples$lib.size * z$samples$norm.factors
+  ## rescale to median sample count
+  out <- round(count_scale * sweep(y, MARGIN = 2, STATS = lib.size, FUN = "/"))
+  dimnames(out) <- dimnames(y)
+  out
+}
+# function for regularized log (rlog) normalization and
+# variance stabilizing transformation (vst) via DeSeq2
+rlog_vst_norm <- function(physeq, method = c("rlog", "vst")){
+  dds <- phyloseq_to_deseq2(physeq, ~ 1)
+  if(method == "rlog") {
+    x <- DESeq2::rlog(dds, blind = TRUE)
+  } else if(method == "vst") {
+    x <- DESeq2::varianceStabilizingTransformation(dds, blind = TRUE)
+  } else stop("method must be either 'rlog' or 'vst'")
+  transotu <- as.data.frame(x@assays@data@listData[[1]])
+  physeq1 <- physeq
+  otu_table(physeq1) <- otu_table(transotu, taxa_are_rows = TRUE)
+  return(physeq1)
+}
+# calculate modified (no negative values) CLR (seurat)
+mod_CLR <- function(physeq) {
+  gm_mean <- function(x, na.rm = TRUE){
+    exp(sum(log(x[x > 0]), na.rm = na.rm) / length(x))}
+  geoMeans = apply(otu_table(physeq), 1, gm_mean)
+  transotu <- apply(otu_table(physeq), 2, function(x){log(1 + (x/geoMeans))})
+  physeq1 <- physeq
+  otu_table(physeq1) <- otu_table(transotu, taxa_are_rows = TRUE)
+  return(physeq1)
+}
+# another CLR mod acc. to https://github.com/satijalab/seurat/issues/1268
+mod_CLR2 <- function(physeq) {
+cl1pr <- function(x) {
+  log1p(x = x/(expm1(x = sum(log1p(x = x[x > 0]), na.rm = TRUE)/length(x=x))))}
+  transotu <- apply(otu_table(physeq), 2, cl1pr)
+  physeq1 <- physeq
+  otu_table(physeq1) <- otu_table(transotu, taxa_are_rows = TRUE)
+  return(physeq1)
+}
+# function for different count transformations
+# https://evayiwenwang.github.io/Managing_batch_effects/index.html#data-processing
+# https://github.com/joey711/shiny-phyloseq/blob/master/panels/paneldoc/Transform.md
+norm_methods <- c("ori", "ra", "log", "hell", "RLE", "CLR", "CLR2") #, "vst"
+
+transform_counts <- function(phylo_obj){
+  out.list <- setNames(vector("list", length(norm_methods)),
+                       norm_methods)
+  for(i in 1:length(out.list)) {out.list[[i]] <- phylo_obj}
+
+  # transform counts into "relative abundances"
+  out.list[["ra"]] <- transform_sample_counts(phylo_obj, function(x){x / sum(x)})
+  
+  # log transform to stabilize variance
+  out.list[["log"]] <- transform_sample_counts(phylo_obj, function(x){log(x + 1)})
+  
+  # transform counts into "Hellinger standardized counts"
+  otu_table(out.list[["hell"]]) <- otu_table(decostand(otu_table(phylo_obj),
+                                                       method = "hellinger"),
+                                             taxa_are_rows = TRUE)
+  
+  # relative log expression (RLE) counts
+  otu_table(out.list[["RLE"]]) <- otu_table(RLE_normalization(phylo_obj),
+                                            taxa_are_rows=TRUE)
+  
+  # variance stabilizing transformation
+  # {tryCatch({
+  # out.list[["vst"]] <- rlog_vst_norm(phylo_obj, method = "vst")
+  # }, error = function(e){cat("ERROR :",conditionMessage(e), "\n")})}
+  
+  # modified centered log-ratio (CLR) transformed counts
+  # https://github.com/satijalab/seurat/issues/2624
+  out.list[["CLR"]] <- mod_CLR(phylo_obj)
+  
+  # modified centered log-ratio (CLR) transformed counts
+  # https://github.com/satijalab/seurat/issues/2624
+  out.list[["CLR2"]] <- mod_CLR2(phylo_obj)
+
+  # remove empty list slots
+  out.list <- out.list[lengths(out.list) > 0]
+  return(out.list)
+}
+# do the transformation
+transform_list_genus <- transform_counts(physeq.data.genus)
+transform_list_otus <- transform_counts(physeq.data.otus)
+```
+\newpage
+## Plot the different count transformations
+We plot the standard deviation of each row (`r ifelse(TU_type, "ZOTUs/ASVs", "OTUs")`) against the mean. The aim of the transformation step is to stabilize the variance across the mean. If the variance (sd) increases with mean, differences observed in distance matrices or ordination (like PCA) will depend mostly on the `r ifelse(TU_type, "ZOTUs/ASVs", "OTUs")` with *highest* counts because they show the largest absolute differences between samples. On the other hand, depending on the normalization strategy (e.g. log transformation with pseudocount of 1), the variance of OTUs with the very *lowest* counts gets inflated. For more information see [this](https://bioconductor.org/packages/release/workflows/vignettes/rnaseqGene/inst/doc/rnaseqGene.html) vignette. 
+The meanSdPlot function from package [vsn](https://bioconductor.org/packages/release/bioc/vignettes/vsn/inst/doc/A-vsn.html) is used to calculate mean, sd and the running median of the standard deviation.
+```{r mean_sd, echo = FALSE, fig.show = 'hide'}
+incProgress(3/8, message = "Plotting transformed data...")
+plot_names <- c("original", "relative", "log", "Hellinger",
+                "RLE", "CLR", "alt. CLR") #, "vst"
+
+# function to extract plot data from vsn::meanSdPlot function
+extract_plot_data <- function(x, extract = c("meansd", "trend")) {
+  otu <- phyloseq::otu_table(x)
+  pt <- vsn::meanSdPlot(otu, ranks = FALSE)
+  if (extract == "meansd") {
+      df <- data.frame(mean = pt$px,
+                       sd = pt$py) %>%
+            rownames_to_column(var = "OTU")} else
+      if (extract == "trend") {
+          df <- data.frame(x = pt$quantile,
+                           y = pt$sd) %>%
+                rownames_to_column(var = "quantile") 
+      }
+  return(df)
+}
+
+# function to extract plot data
+plot_mean_sd <- function(x) {
+  # extract data
+  z <- bind_rows(lapply(x, extract_plot_data, extract = "meansd"),
+               .id = "normalization") %>%
+  mutate(normalization = factor(normalization, levels = norm_methods))
+  z1 <- bind_rows(lapply(x, extract_plot_data, extract = "trend"),
+                .id = "normalization") %>%
+  mutate(normalization = factor(normalization, levels = norm_methods))
+  
+  # plotting
+  pt <- ggplot(z, aes(x = mean, y = sd)) +
+  geom_hex(bins = 50) +
+  geom_line(data = z1, aes(x = x, y = y), color = "red", size = 1, show.legend = TRUE) +
+  theme_article(base_size = 9) +
+  scale_fill_viridis_c() +
+  facet_wrap(facets = vars(normalization), scales = "free",
+             labeller = labeller(normalization = 
+                                   structure(plot_names, names = norm_methods)))
+  
+  # modify faceted plot
+  # source functions to fix plot sizes
+  # source("../helper_functions/resize_ggplot2_panels.R")
+  pt <- facet_shift_legend_fix_panel(pt, p.width = 6, p.height = 5)
+  return(pt)
+}
+meansd_otus <- plot_mean_sd(transform_list_otus)
+meansd_genus <- plot_mean_sd(transform_list_genus)
+tu_capt <- paste(
+  "Comparison of variance distribution for different normalization methods for",
+  ifelse(TU_type, "ZOTUs/ASV", "OTU"), "counts. The standard deviation of each",
+  ifelse(TU_type, "ZOTUs/ASV", "OTU"), "is plotted against the mean.",
+  ifelse(TU_type, "ZOTUs/ASVs", "OTUs"),
+  "are binned with a width of 50. The red line shows the running median of the standard deviation. Ideally, the variance (sd) should approximately be the same across different mean values.")
+```
+```{r plot_mean_sd_otu, echo = FALSE,  fig.dim = c(attr(meansd_otus, "plot_width"), attr(meansd_otus, "plot_height")), fig.cap = tu_capt}
+meansd_otus
+```
+```{r plot_mean_sd_genus, echo = FALSE,  fig.dim = c(attr(meansd_genus, "plot_width"), attr(meansd_genus, "plot_height")), fig.cap = "Comparison of variance distribution for different normalization methods for genus counts. The standard deviation of each genus is plotted against the mean. Genera are binned with a width of 50. The red line shows the running median of the standard deviation. Ideally, the variance (sd) should approximately be the same across different mean values."}
+meansd_genus
+```
+\newpage
+```{r export_files, echo = FALSE}
+incProgress(2/8, message = "Saving...")
+
+genus_file <- paste0(output_dir3, "/transform_list_genus_",
+                     ifelse(TU_type, "zotu", "otu"), ".rds")
+tu_file <- paste0(output_dir3, "/transform_list_",
+                     ifelse(TU_type, "zotu", "otu"), ".rds")
+
+# save list of all transformed physeq objects to file
+saveRDS(transform_list_genus, file =  genus_file)
+saveRDS(transform_list_otus, file =  tu_file)
+```
+## Export count-transformed data
+Both `r ifelse(TU_type, "ZOTU/ASV", "OTU")` and genus counts were exported as lists in RDS format:
+
+* `r ifelse(TU_type, "ZOTU/ASV", "OTU")` counts: 
+
+\footnotesize ``r tu_file`` \normalsize
+
+* Genus counts: 
+
+\footnotesize ``r genus_file`` \normalsize
+
+## Record session information
+\tiny
+```{r session_info, echo = FALSE}
+# https://stackoverflow.com/questions/25646333/code-chunk-font-size-in-rmarkdown-with-knitr-and-latex
+print(sessionInfo())
+```

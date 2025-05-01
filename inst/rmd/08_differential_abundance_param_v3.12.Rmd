@@ -1,0 +1,1515 @@
+---
+title: "Differential abundance analysis"
+author: "`r params$author`"
+date: "`r format(Sys.time(), '%d.%m.%y')`"
+header-includes:
+- \usepackage{float} #use the 'float' package
+- \floatplacement{figure}{H} #make every figure with caption = h
+- \usepackage{flafter}
+- \usepackage{booktabs}
+- \usepackage{longtable}
+- \usepackage{array}
+- \usepackage{multirow}
+- \usepackage{wrapfig}
+- \usepackage{colortbl}
+- \usepackage{pdflscape}
+- \usepackage{tabu}
+- \usepackage{threeparttable}
+- \usepackage{threeparttablex}
+- \usepackage[normalem]{ulem}
+- \usepackage{makecell}
+- \usepackage{xcolor}
+output:
+  pdf_document:
+    latex_engine: lualatex
+    fig_width: 7.5
+    fig_height: 10
+    fig_caption: yes
+    df_print: kable
+    extra_dependencies: ["float"]
+    includes:
+      in_header: header.tex
+  word_document: default
+  html_document:
+    df_print: kable
+    theme: cerulean
+    highlight: haddock
+    toc: yes
+    toc_depth: 3
+    toc_float: TRUE
+    collapsed: FALSE
+    smooth_scroll: TRUE
+    code_fold: show
+params:
+  author:
+    label: "author of the analysis"
+    value: "no author given"
+  workdir:
+    label: "working directory"
+    value: "U:/00_Shiny/Test"
+  subfolder:
+    label: "subdirectory"
+    value: !r format(Sys.time(), '%y%m%d')
+  TU_type:
+    label: "type of taxonomic units analyzed"
+    value: OTU
+    choices: [ZOTU, OTU]
+  useMC:
+    label: "whether to use multicore processing or number of processors"
+    value: TRUE
+  analysis_level:
+    label: "taxonomic level to analyze"
+    value: all
+    choices: [all, Phylum, Class, Order, Family, Genus, Species, none]
+  var_test:
+    label: "metadata variable to analyze"
+    value: NULL
+  trans_method:
+    label: "count transformation used before analysis"
+    value: CLR
+  comp_list:
+    label: "list of factor levels to compare"
+    value: !r NULL
+  seed:
+    label: "set seed value"
+    value: 42 
+  min_count:
+    label: "count threshold for ASVs/OTUs together with 'min_count_prev'"
+    value: 10
+  min_count_prev:
+    label: "remove ASVs/OTUs less of 'min_count' counts in at least 'min_count_prev'% of samples"
+    value: 20
+  min_rel_abund:
+    label: "minimum relative abundance of ASVs/OTUs together with 'min_rel_abund_prev'"
+    value: 0.2
+  min_rel_abund_prev:
+    label: "remove ASVs/OTUs with less than 'min_rel_abund' in at least 'min_rel_abund_prev'% of samples"
+    value: 10  
+  cutoff_pval:
+    label: "cutoff for (adj.) p value"
+    value: 0.05
+  padj_method:
+    label: "set p value adjustment method"
+    value: fdr
+    choices: [holm, hochberg, hommel, bonferroni, BH, BY, fdr, none]
+  cutoff_fcda:
+    label: "cutoff for minimum fold-change differential abundance"
+    value: 2
+  cutoff_lda:
+    label: "cutoff for minimum effect size (LDA score) in lefse"
+    value: 2
+  cutoff_W:
+    label: "cutoff for minimum W statistics in ANCOM /ANCOM-BC"
+    value: 0.75
+  cutoff_aldex:
+    label: "cutoff for minimum effect size in aldex"
+    value: 1
+  metacoder_tax:
+    label: "taxonomy level for metacoder trees"
+    value: !r NULL
+  volcano_label:
+    label: "label significant hits in volcano plot"
+    value: 20  
+fontsize: 10pt
+urlcolor: blue
+papersize: a4
+editor_options: 
+  chunk_output_type: console
+---
+```{r version, echo = FALSE}
+script_version <- "3.12"
+```
+This is 'Differential abundance analysis' script version **`r script_version`** by Dr. Roman Gerlach.
+
+### Load required libraries
+```{r libraries, echo = TRUE, results = 'hide', warning = FALSE, message = FALSE}
+setProgress(1/7, message = "Load required libraries...")
+library(tidyverse)
+library(ggrepel)
+library(ggtext)
+library(edgeR)
+library(phyloseq)
+library(microbiomeMarker)
+library(parallel)
+library(metacoder)
+library(UpSetR)
+library(grid)
+library(RColorBrewer)
+library(pals)
+library(Polychrome)
+library(colorspace)
+library(egg)
+library(kableExtra)
+library(writexl)
+library(pander)
+```
+```{r global_options, echo = FALSE}
+# set directories
+workdir <- params$workdir
+subdir <- params$subfolder
+
+# Set up global options for nice reports and keeping figures:
+current_dir <- paste(workdir, subdir, sep = "/")
+knitr::opts_chunk$set(fig.width = 7.5, fig.align = "center", out.extra = "",
+                      warning = FALSE, message = FALSE, fig.pos = "!H",
+                      cache.path = current_dir,
+                      dev = "cairo_pdf")
+options(knitr.kable.NA = '')
+
+# setting TU type
+TU_type <- ifelse(params$TU_type == "OTU", FALSE, TRUE)
+trans_file <- ifelse(TU_type, input$uploadZOTUtrans$datapath, input$uploadOTUtrans$datapath)
+
+# check and create directory structure
+if(!dir.exists(paste0(current_dir, "/DA_analysis"))) {dir.create(paste0(current_dir, "/DA_analysis"))}
+if(!dir.exists(paste0(current_dir, "/DA_analysis/data"))) {dir.create(paste0(current_dir, "/DA_analysis/data"))}
+if(!dir.exists(paste0(current_dir, "/DA_analysis/figures"))) {dir.create(paste0(current_dir, "/DA_analysis/figures"))}
+```
+## 1. Setting up environment and script parameters
+
+Import the following list containing the phyloseq objects:
+
+\footnotesize
+``r trans_file``
+\normalsize
+
+* Taxonomic level of analysis = **`r params$analysis_level`**
+* Count transformation used prior analysis = **`r params$trans_method`**
+* Variable to test = **`r params$var_test`**
+
+### 1.1 Define contrasts
+Two group comparisons are defined by a list of character vectors of length two. The order determines the direction of comparison. The first element is the numerator for the fold change. The second element is used to specify the reference group (control) and therefore defines the baseline (denominator for fold change). Attention! This order is reversed compared to the original implementation in the [`microbiomeMarker` package](https://github.com/yiluheihei/microbiomeMarker).    
+The following factor levels of variable **`r params$var_test`** are compared:
+`r pander::pander(params$comp_list)`
+
+```{r environment, echo = FALSE}
+
+seed <- params$seed
+set.seed(seed)
+# https://stackoverflow.com/questions/34029611/how-to-use-objects-from-global-environment-in-rstudio-markdown
+# source functions for import
+# source("../helper_functions/functions_import.R", local = knitr::knit_global())
+
+# source functions for plotting
+# source("../helper_functions/functions_plotting.R", local = knitr::knit_global())
+
+# source accessory functions, e.g. for working with phyloseq objects
+# source("../helper_functions/functions_accessory.R", local = knitr::knit_global())
+
+# select tax level
+analysis_level <- params$analysis_level 
+
+# variable to analyze
+var_test <- params$var_test
+
+# import list of phyloseq objects (with transformed count data)
+physeq.list <- readRDS(file = trans_file)
+
+# import comparison list
+comp <- params$comp_list
+# apply names to comparison list
+names(comp) <- sapply(comp, paste, collapse = "_vs_")
+
+
+# define DA methods
+method_vec <- c("edger" = "EdgeR", "lv" = "Limma (voom)", "deseq2" = "DESeq2",
+                "ancom" = "ANCOM", "ancombc" = "ANCOM-BC", "lefse" = "LEfSe",
+                "aldex" = "ALDEx2", "mgzig" = "MetagenomeSeq (ZIG)",
+                "mgziln" = "MetagenomeSeq (ZILN)")
+
+# calculate number of cores to use depending on 'useMC' option and OS
+useMC <- params$useMC
+# maximum number of cores available
+max_cores <- parallel::detectCores(logical = TRUE)
+if(is.logical(useMC)) {
+  if(useMC) {
+    if(.Platform$OS.type == "windows") {
+      # adjust number of clusters depending on number of comparisons
+      # this is mainly to save memory due to unused, but initiated clusters
+      num_cores <- if(length(comp) <= max_cores) {
+        length(comp)} else if(length(comp)/2 <= max_cores) {
+          ceiling(length(comp)/2)} else max_cores-1
+    } else {
+      num_cores <- max_cores-1
+    }
+  }
+} else if(is.numeric(useMC)) {
+  num_cores <- ifelse(useMC < max_cores, useMC, max_cores-1)
+  useMC <- ifelse(useMC > 1, TRUE, FALSE)
+} else stop("variable 'useMC' should be either logical or numeric")
+```
+
+A function is used to check whether the list with comparisons is valid:
+
+`r pander::pander(check_comp_list(comp))`
+
+### 1.2 Parameters of DA analyses
+
+The following parameters were used for filtering the data in advance:    
+
+`r ifelse(TU_type, "ZOTUs/ASVs", "OTUs")` should have at least **`r params$min_count`** counts in at least **`r params$min_count_prev` %** of samples ***OR***     
+a relative minimum abundance of **`r params$min_rel_abund` %** in at least **`r params$min_rel_abund_prev` %** of samples.
+
+The following parameters were used of differential abundance (DA) analyses:
+
+* cutoff for (adj.) p value (cutoff_pval) =  **`r params$cutoff_pval`**
+* method for p value adjustment (padj_method) = **`r params$padj_method`**
+* cutoff for minimum fold-change (cutoff_fcda) = **`r params$cutoff_fcda`**
+* cutoff for minimum effect size (LDA score) in LEfSe (cutoff_lda) = **`r params$cutoff_lda`**
+* cutoff for minimum W statistics in ANCOM /ANCOM-BC (cutoff_W) = **`r params$cutoff_W`**
+* cutoff for minimum effect size in ALDEx2 (cutoff_aldex) = **`r params$cutoff_aldex`**
+
+Parameter for labeling significant hits in volcano plots. Use ether 'all' or 'none' for labeling all significant hits or none. If a number is provided, labels for the respective number of top significant hits are shown.   
+
+* volcano_label = **`r params$volcano_label`**
+
+Parameter to agglomerate `metacoder` heat trees at a specified taxonomic level. Use `NULL` for no agglomeration (tree tips = `r ifelse(TU_type, "ZOTUs/ASVs", "OTUs")`).
+
+* metacoder_tax = **`r params$metacoder_tax`**
+
+`r if(useMC) {paste("The DA analysis is done in parallel mode using", num_cores, "CPUs.")} else {paste("The DA analysis is done in serial mode (no multiprocessing).")}`
+```{r analysis_parameters, echo = FALSE}
+min_count <- params$min_count
+min_count_prev <- params$min_count_prev
+min_rel_abund <- params$min_rel_abund
+min_rel_abund_prev <- params$min_rel_abund_prev
+cutoff_pval <- params$cutoff_pval
+padj_method <- params$padj_method
+cutoff_fcda <- params$cutoff_fcda
+cutoff_lda <- params$cutoff_lda
+cutoff_W <- params$cutoff_W
+cutoff_aldex <- params$cutoff_aldex
+volcano_label <- params$volcano_label
+metacoder_tax <- params$metacoder_tax
+```
+```{r analysis_parameters_debug, echo = FALSE, eval = FALSE}
+# # variable to analyze
+# # var_test <- "geno2_day"
+# var_test <- "group"
+# analysis_level <- "all"
+# useMC <- TRUE
+# 
+# setwd(normalizePath(r"(O:\04_projects_NGS\Vieth\run_01\05_bioinformatics\01_Vieth_OG)", "/"))
+# workdir <- getwd()
+# subdir <- paste(format(Sys.time(), '%y%m%d'), var_test, sep = "_")
+# current_dir <- paste(workdir, subdir, sep = "/")
+# 
+# # seed
+# seed <- 42
+# 
+# # source functions for data import / conversion
+# source("../helper_functions/functions_import.R")
+# 
+# # source functions for plotting
+# source("../helper_functions/functions_plotting.R")
+# 
+# # source accessory functions, e.g. for working with phyloseq objects
+# source("../helper_functions/functions_accessory.R")
+# 
+# # define DA methods
+# method_vec <- c("edger" = "EdgeR", "lv" = "Limma (voom)", "deseq2" = "DESeq2",
+#                 "ancom" = "ANCOM", "ancombc" = "ANCOM-BC", "lefse" = "LEfSe",
+#                 "aldex" = "ALDEx2", "mgzig" = "MetagenomeSeq (ZIG)",
+#                 "mgziln" = "MetagenomeSeq (ZILN)")
+# 
+# # import list of phyloseq objects
+# TU_type <- TRUE
+# physeq.list <- readRDS(file = paste0(workdir,"/data/transform_list_zotu.rds"))
+# 
+# # import comparison list
+# comp <-   list(
+#   c("ASD", "Control")
+# )
+# 
+# # apply names to comparison list
+# names(comp) <- sapply(comp, paste, collapse = "_vs_")
+# 
+# min_count <- 10
+# min_count_prev <- 10
+# min_rel_abund <- 0.1
+# min_rel_abund_prev <- 10
+# cutoff_pval <- 0.05
+# padj_method <- "fdr"
+# cutoff_fcda <- 2
+# cutoff_lda <- 2
+# cutoff_W <- 0.75
+# cutoff_aldex <- 1
+# metacoder_tax <- "Genus"
+# volcano_label <- 20
+```
+
+## 2. Filter `r ifelse(TU_type, "ZOTUs/ASVs", "OTUs")`
+Remove OTUs according to prevalence and abundance filter parameters. Filter settings are applied on the original count data. The identified `r ifelse(TU_type, "ZOTUs/ASVs", "OTUs")` are subsequently removed from the previously transformed (see script output `03_count_transform.pdf`) data set.
+```{r filter_otus, echo = FALSE}
+incProgress(1/7, message = "Filter count data...")
+
+# remove taxa with low prevalence / abundance
+# the function 'phyloseq_filter_prev' uses the parameters 'min_count', 'min_count_prev', 'min_rel_abund' and 'min_rel_abund_prev'
+ps.ori.filt <- phyloseq_filter_prev(physeq.list[["ori"]])
+
+# identify filtered taxa (ZOTUs/OTUs)
+prev_removed_df <- id_taxa_removed(physeq.list[["ori"]], ps.ori.filt, min_ct = min_count)
+
+# import and filter transformed count data
+trans_method <- params$trans_method
+if(trans_method %in% names(physeq.list)) {
+  ps.filt <- filter_trans_ps(prev_removed_df, trans_method)
+} else stop(paste("Selected transformation method:", trans_method, "is not present in transformed count list!"))
+```
+`r if(nrow(prev_removed_df) != 0) {paste("There", ifelse(nrow(prev_removed_df) == 1, "was", "were"), nrow(prev_removed_df), ifelse(nrow(prev_removed_df) == 1, ifelse(TU_type, "ZOTU/ASV", "OTU"), ifelse(TU_type, "ZOTUs/ASVs", "OTUs")), "removed based on prevalence and abundance filtering parameters.")} else {paste("No", ifelse(TU_type, "ZOTUs/ASVs", "OTUs"), "were removed based on prevalence and abundance filtering parameters.")}`
+```{r filter_table, eval = nrow(prev_removed_df) != 0, echo = FALSE}
+# display summary df using kable
+# using captions in combination with kable_style position options requires to escape '_' with '\\'
+ kbl(head(prev_removed_df, 20), caption = paste("Overview ", if(nrow(prev_removed_df) > 20) "The 20", ifelse(TU_type, "ZOTUs/ASVs", "OTUs"), "with highest read count are shown."),
+ booktabs = TRUE, linesep = "", digits = 3, format.args = list(big.mark = ",")) %>%
+ kable_styling(latex_options = c("striped", "HOLD_position", "scale_down"))
+```
+## 3. Modify taxonomy
+Process phyloseq taxonomy nomenclature to fill up missing entries using internal functions of the [`microbiomeMarker` package](https://github.com/yiluheihei/microbiomeMarker).
+```{r modify_taxonomy}
+# process phyloseq taxonomy nomenclature to fill up missing entries
+tax <- microbiomeMarker:::fix_duplicate_tax(ps.filt) %>%
+  microbiomeMarker:::fix_na_tax() %>%
+  microbiomeMarker:::add_prefix() %>%
+  tax_table() %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "TU") %>%
+  mutate(
+    Species = ifelse(
+      str_detect(Species, "s__$"), paste0(Species, TU),
+       ifelse(str_detect(Species, "s__[[:alpha:]]*_[[:alpha:]]*$"),
+              paste0(Species, "_", TU),
+              paste0("s__", stringr::str_match(Genus, "g__(.*)")[,2], "_",
+                     stringr::str_match(Species, "s__(.*)")[,2], "_", TU)))
+  )
+# apply changes to phyloseq objects
+tax_table(ps.filt) <- tax_table(as.matrix(
+  tax %>% column_to_rownames(var = "TU")
+))
+tax_table(ps.ori.filt) <- tax_table(as.matrix(
+  tax %>% column_to_rownames(var = "TU")
+))
+
+```
+## 4. Plotting functions
+
+### 4.1 LEfSe and ANCOM plots
+
+A modified function `lefserPlot2()` for LEfSe and ANCOM data is based on [`lefserPlot()`](https://github.com/waldronlab/lefser/blob/devel/R/lefserPlot.R) but was adapted to work with `microbiomeMarker`-class objects and different taxonomic levels.
+```{r lefserplot2, echo = FALSE}
+# modified lefserPlot function
+# 
+# df <- da_extract[["da_data"]][["WT_diet_vs_WT_reference"]][["lefse"]]
+# method = "lefse"
+# comp_pair. = c("WT_diet", "WT_reference")
+# tax. = tax2
+# bar.height = 0.5
+# colors = c("red", "forestgreen")
+# nudge.labels = 0.05
+
+
+lefserPlot2 <- function(df, method = c("lefse", "ancom"), comp_pair., tax.,
+                        bar.height = 0.5, colors = c("red", "forestgreen"),
+                        nudge.labels = 0.05) {
+  # generate plot title
+  pt.title <- paste(method_vec[method], "comparison:\n",
+                    paste(comp_pair., collapse = " vs. "))
+
+  # prepare df depending on tax level
+  if(analysis_level == "all") {
+    df <- df %>%
+      dplyr::left_join(tax., by = c("feature" = "all")) %>%
+      dplyr::select(Names = TU, scores = starts_with("ef")) %>%
+      dplyr::filter(Names != "k__Bacteria")
+  } else if(analysis_level == "none") {
+    df <- df %>%
+      dplyr::left_join(tax., by = c("feature" = "TU")) %>%
+      dplyr::select(Names = feature, scores = starts_with("ef"))
+  } else {
+    df <- df %>%
+      select(Names = feature, scores = starts_with("ef"))
+  }
+
+  df <- df %>%
+    mutate(group = as.factor(ifelse(scores > 0, 1, 0)),
+           Names = reorder(Names, scores))
+  plt <-
+    ggplot(df, aes(Names, scores)) + ylab(
+      if(method == "lefse") {"LDA SCORE (log 10)"}
+      else if(method == "ancom") {"CLR log-fold change to mean"}) +
+    theme_bw() +
+    theme(
+      legend.position = "none",
+      axis.ticks.y = element_blank(),
+      axis.title.y = element_blank(),
+      axis.title.x = element_text(size = 11, face = "bold"),
+      axis.text.y  = element_blank(),
+      axis.text.x  = element_text(
+        vjust = 0.7,
+        size = 11,
+        face = "bold"
+      ),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.y = element_blank(),
+      plot.title = element_text(
+        hjust = 0.5,
+        size = 13,
+        face = "bold"
+      ),
+      plot.subtitle = element_text(
+        hjust = 0.5,
+        size = 12,
+      )
+    ) +
+    {if(!is.null(pt.title)) ggtitle(label = paste0(pt.title, collapse = " vs. "),
+                                    subtitle = paste("Analysis level:", analysis_level))} +
+    geom_bar(stat = "identity", aes(fill = group), color = "black") +
+    geom_text(aes(label = Names, y = 0), hjust = ifelse(df$scores > 0, 1, 0),
+              nudge_y = ifelse(df$scores > 0, -nudge.labels, nudge.labels)) +
+    scale_fill_manual(values = colors) +
+    coord_flip()
+  plt1 <- fix_ggplot_panel(plt, p.width = 17, p.height = bar.height * nrow(df),
+                           p.margin = 10)
+  return(plt1)
+}
+
+```
+### 4.2 Volcano plots
+
+To make all volcano plots comparable, a fixed color set is defined for all phyla: 
+```{r phyla_colors, warning = TRUE}
+# use fixed color scale for phyla
+all_phyla <- structure(c("#D55E00", "#E69F00", "#999933", "#009E73", "#332288",
+                         "#F0E442", "#117733", "#0072B2", "#56B4E9", "#CC79A7",
+                         "#88CCEE", "#AA4499", "#661100", "#000000"),
+                       names = c("Actinobacteriota", "Bacteroidota", "Campylobacterota",
+                                 "Chloroflexi", "Cyanobacteria", "Deferribacterota",
+                                 "Desulfobacterota", "Firmicutes", "Fusobacteriota",
+                                 "Patescibacteria", "Proteobacteria", "Spirochaetota",
+                                 "Synergistota", "Verrucomicrobiota")
+)
+
+# check presence of phyla in data
+phyla_in_data <- as.vector(str_remove(unique(tax_table(ps.ori.filt)[, "Phylum"])@.Data, "^p__"))
+
+# check whether phyla are missing in color scale
+phyla_no_color <- phyla_in_data[!(phyla_in_data %in% names(all_phyla))]
+if (length(phyla_no_color) != 0) {
+  warning(paste("For the following phyla no colors are defined:",
+                paste(phyla_no_color, collapse = ", ")))
+} else message(paste("Colors are defined for all phyla in data set."))
+
+# remove colors not in data set
+all_phyla <- all_phyla[names(all_phyla) %in% phyla_in_data]
+```
+
+A function `plot_taxa_volcano()` uses results from 'EdgeR', 'Limma (voom)', 'DESeq2', 'ANCOM-BC', 'ALDEx2', 'MetagenomeSeq (ZIG)' or 'MetagenomeSeq (ZILN)' analyses stored in `microbiomeMarker`-class objects. The function can handle analyses at all possible taxonomic levels.
+
+```{r volcanoplot, echo = FALSE}
+# df <- da_extract[["da_data"]][["ASD_vs_Control"]][["edger"]]
+# method = "edger"
+# comp_pair. = c("ASD", "Ctrl")
+# sigthresh = cutoff_pval
+# tax. = tax2
+# deltathresh = cutoff_fcda
+
+plot_taxa_volcano <- function(
+    df, method,
+    phyla = all_phyla, comp_pair., sigthresh = cutoff_pval, tax., 
+    deltathresh = cutoff_fcda) {
+
+  # generate plot title
+  pt.title <- paste(method_vec[method], "comparison:\n",
+                    paste(comp_pair., collapse = " vs. "))
+
+  # prepare df depending on tax level
+  if(analysis_level == "all") {
+    df <- df %>%
+      dplyr::left_join(tax., by = c("feature" = "all")) %>%
+      dplyr::filter(!duplicated(feature),
+             !(TU == "k__Bacteria" & sig == "sig")) %>%
+      mutate(
+        across(Kingdom:TU, \(x) str_remove(x, "^[a-z]{1}__")))#,
+        # TU = ifelse(TU == "NANA", Species, TU),
+        # TU = str_remove_all(TU, paste(c("_f_", "_s_", "_g__"), collapse = "|")))
+  } else if(analysis_level == "none") {
+    df <- df %>%
+      dplyr::left_join(tax., by = c("feature" = "TU")) %>%
+      dplyr::rename(TU = feature) %>%
+      mutate(across(Kingdom:TU, \(x) str_remove(x, "^[a-z]{1}__")))
+  } else {
+    df <- df %>%
+      dplyr::left_join(tax., by = setNames(analysis_level, "feature")) %>%
+      dplyr::rename(!!analysis_level := feature) %>%
+      relocate(all_of(analysis_level), .after = last_col()) %>%
+      mutate(across(Kingdom:all_of(analysis_level), \(x) str_remove(x, "^[a-z]{1}__")))
+  }
+  # adjust 0 adj. p value to new minimal value
+  df$padj <- ifelse(df$padj == 0, min(df[df$padj != 0, "padj"])*0.9, df$padj)
+  
+  # store names of significantly regulated genes for labeling
+  if(analysis_level %in% c("all", "none")) {
+    pointsToLabel <- pull(df[which(df$sig == "sig"), "TU"])
+  } else {pointsToLabel <- pull(df[which(df$sig == "sig"), analysis_level])}
+  
+  # filter points to label depending on 'volcano_label' variable
+  if(class(volcano_label) == "numeric" | volcano_label == "all" | volcano_label == "none") {
+    if(volcano_label == "all") {pointsToLabel <- pointsToLabel
+    } else if(class(volcano_label) == "numeric") {
+      n <- round(volcano_label, 0)
+      pointsToLabel <- head(pointsToLabel, n)
+    }
+  } else {stop("variable 'volcano_label should be either numeric, 'all' or 'none'")}
+
+  plt <- ggplot(df, aes(x = get(str_subset(colnames(df), "^ef")), y = -log10(padj))) +
+    geom_vline(xintercept = -log2(deltathresh), color = "red", linetype = "longdash") +
+    geom_vline(xintercept = log2(deltathresh), color = "red", linetype = "longdash") +
+    geom_vline(xintercept = 0, color = "black", linetype = "longdash") +
+    geom_hline(yintercept = -log10(sigthresh), color = "red", linetype = "longdash") +
+    geom_point(aes(fill = Phylum), shape = 21, size = 3)  +
+    scale_fill_manual(values = all_phyla) +
+    guides(fill = guide_legend(nrow = 3, byrow = TRUE)) +
+    theme_bw(base_size = 12) +
+    scale_x_continuous(name = if(method == "aldex") {"Effect size"
+      } else if(method == "ancombc") {"W (logFC/SE)"
+        } else "log2FC", expand = expansion(mult = 0.05)) +
+    scale_y_continuous(name = "-log10(q)", expand = expansion(mult = c(0.02, 0.12))) +
+    ggtitle(pt.title, subtitle = paste0("Analysis level: ", analysis_level)) +
+    theme(legend.position = "bottom",
+          legend.title = element_blank(),
+          plot.title = element_text(hjust = 0.5),
+          plot.subtitle = element_text(hjust = 0.5, size = 10)) +
+    {if(analysis_level %in% c("all", "none") & volcano_label != "none")
+      geom_text_repel(
+        max.overlaps = Inf,
+        alpha = 0.5,
+        data = subset(df, TU %in% pointsToLabel),
+        aes(label = TU),
+        size = 3,
+        box.padding = unit(0.25, "lines"),
+        point.padding = unit(0.15, "lines"))} +
+    {if(!(analysis_level %in% c("all", "none")) & volcano_label != "none")
+      geom_text_repel(
+        max.overlaps = Inf,
+        alpha = 0.5,
+        data = subset(df, get(analysis_level) %in% pointsToLabel),
+        aes(label = get(analysis_level)),
+        size = 3,
+        box.padding = unit(0.25, "lines"),
+        point.padding = unit(0.15, "lines"))}
+  return(plt)
+}
+```
+## 5. Differential abundance analyses
+The main function `da_analyses` sequentially performs differential abundance (DA) analyses using all methods implemented in the [`microbiomeMarker`](https://github.com/yiluheihei/microbiomeMarker) package and summarizes the results. The methods are exerted without p-value cutoffs (if p-value is available in results) to use the data for volcano plots (including non-significant results). However, significant results are filtered and summarized for all methods in a data frame. 
+
+### 5.1 Linear models
+The following five linear models are used to analyze DA:
+
+* **edgeR** Robinson, MD, McCarthy, DJ and Smyth, GK. 2010. EdgeR: A Bioconductor Package for Differential Expression Analysis of Digital Gene Expression Data. Bioinformatics 26 (1): 139–40. doi: [10.1093/bioinformatics/btp616](https://doi.org/10.1093/bioinformatics/btp616)
+* **limma (voom)** limma-voom: Law, CW, Chen, Y *et al*. 2014. Voom: Precision Weights Unlock Linear Model Analysis Tools for Rna-Seq Read Counts. Genome biology, 15(2), 1-17. doi: [10.1186/gb-2014-15-2-r29](https://doi.org/10.1186/gb-2014-15-2-r29)
+* **DESeq2** Love, MI, Huber, W and Anders, S. 2014. Moderated Estimation of Fold Change and Dispersion for Rna-Seq Data with Deseq2. Genome Biology 15 (12): 1–21. doi: [10.1186/s13059-014-0550-8](https://doi.org/10.1186/s13059-014-0550-8)
+* **ANCOM-BC** Huang, L and Peddada, SD. 2020. Analysis of Compositions of Microbiomes with Bias Correction. Nature Communications 11 (1): 1–11. doi: [10.1038/s41522-020-00160-w](https://doi.org/10.1038/s41522-020-00160-w)
+* **MetagenomeSeq, Zero-inflated Gaussian mixture model (ZIG)** metagenomeSeq: Paulson, JN, Stine, OC *et al*. 2013. Differential Abundance Analysis for Microbial Marker-Gene Surveys. Nature Methods 10 (12): 1200–1202. doi: [10.1038/nmeth.2658](https://doi.org/10.1038/nmeth.2658)
+
+Pair-wise comparisons are done by setting the argument `contrast`. The contrasts are provided via the `comp` list with the first element defining the numerator and the second element the denominator of the fold change. The order of the two length character vector stored in the `comp` list is reversed before being used as parameter for the `contrast` argument.
+
+### 5.2 Non-linear models
+The following four non-linear models are used to analyze DA:
+
+* **LEfSe** LEfSe: Segata, N, Izard, J *et al*. 2011. Metagenomic Biomarker Discovery and Explanation. Genome Biology 12 (6): 1–18. doi: [10.1186/gb-2011-12-6-r60](https://doi.org/10.1186/gb-2011-12-6-r60)
+* **ALDEx2** Fernandes, AD, Reid, JNS *et al*. 2014. Unifying the Analysis of High-Throughput Sequencing Datasets: Characterizing Rna-Seq, 16S rRNA Gene Sequencing and Selective Growth Experiments by Compositional Data Analysis. Genome Biology 15(2): 1–17. doi: [10.1186/2049-2618-2-15](https://doi.org/10.1186/2049-2618-2-15)
+* **ANCOM** Mandal, S, Van Treuren, W *et al*. 2015. Analysis of Composition of Microbiomes: A Novel Method for Studying Microbial Composition. Microbial Ecology in Health and Disease 26 (1): 27663. doi: [10.3402/mehd.v26.27663](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4450248/)
+* **MetagenomeSeq, Zero-inflated Log-Normal mixture model (ZILN)** metagenomeSeq: Paulson, JN, Stine, CO, *et al*. 2013. Differential Abundance Analysis for Microbial Marker-Gene Surveys. Nature Methods 10 (12): 1200–1202. doi: [10.1038/nmeth.2658](https://doi.org/10.1038/nmeth.2658)
+
+Because only variables with two factor levels are supported by these methods, the `phyloseq` object is subset to contain only the factors of variable ``r var_test`` to be compared. After removal of the other samples, the remaining two factors are re-leveled that the reference comes first before doing pairwise comparisons.
+
+Another approach uses machine learning (ML) on this subset containg only two factor levels. Here, the supervised learning (SL) method 'random forest' with the `importance` parameter of the [`ranger`](https://www.rdocumentation.org/packages/ranger/) function set to `impurity_corrected` is applied.
+
+```{r DA_function_new, echo = FALSE}
+incProgress(1/7, message = "Run differential abundance analysis (may take a while, don't worry)...")
+
+# comp_pair <- comp[[5]]
+# ps.ori <- ps.ori.filt
+# ps.trans <- ps.filt
+da_analyses <- function(comp_pair) {
+  
+  ### prepare storage lists
+  # to store results (as 'microbiomeMarker' object)
+  res.list <- setNames(
+    vector("list", length(method_vec)), names(method_vec)
+  )
+  
+  # to store status
+  stat.list <- list()
+
+  # calculate and format time difference
+  calc_difft <- function(method, start.t = s, l = res.list) {
+    x <- format_difftime(first = start.t, second = Sys.time())
+    method_name <- if(method == "ML") "machine learning" else method_vec[[method]]
+    if(method == "ML" & exists("ml.out")) {
+      return(paste(method_name, "**successful** after:", x))
+    } else if(method == "ML" & !exists("ml.out")) {
+      return(paste(method_name, "**failed** after:", x))
+    } else if(method != "ML" & is.null(l[[method]])) {
+      return(paste(method_name, "**failed** after:", x))
+    } else if(method != "ML" & is.null(microbiomeMarker::marker_table(l[[method]]))) {
+      return(paste(method_name, "produced **no significant hits** after:", x))
+    } else if(method != "ML") {return(paste(method_name, "**successful** after:", x))}
+  }
+  
+  ### differential analysis with methods based on linear models
+  ## define function parameters (linear models)
+  fct_args_lin <- list(
+                       var_test,
+                       norm = "none",
+                       taxa_rank = analysis_level,
+                       contrast = rev(comp_pair),
+                       pvalue_cutoff = 1,
+                       p_adjust = padj_method
+  )
+  
+  # perform differential analysis using edgeR in combination with raw counts
+  set.seed(seed)
+  {tryCatch({
+    s <- Sys.time()
+    res.list[["edger"]] <- base::do.call(
+      microbiomeMarker::run_edger, c(list(ps.ori.filt), fct_args_lin))
+    stat.list[[1]] <- calc_difft("edger")
+    }, error = function(e){cat("ERROR :",conditionMessage(e), "\n")})
+  }
+  
+  # perform differential analysis using limma-voom in combination with transformed counts
+  set.seed(seed)
+  {tryCatch({
+    s <- Sys.time()
+    res.list[["lv"]] <- base::do.call(
+      microbiomeMarker::run_limma_voom, c(list(ps.filt), fct_args_lin)) 
+    stat.list[[2]] <- calc_difft("lv")
+    }, error = function(e){cat("ERROR :",conditionMessage(e), "\n")})
+  }
+  
+  # perform DESeq2-based differential analysis in combination with raw counts 
+  set.seed(seed)
+  {tryCatch({
+    s <- Sys.time()
+    res.list[["deseq2"]] <- base::do.call(
+      microbiomeMarker::run_deseq2, c(list(ps.ori.filt), fct_args_lin, list(fitType = "local")))
+    stat.list[[3]] <- calc_difft("deseq2")
+    }, error = function(e){cat("ERROR :",conditionMessage(e), "\n")})
+  }
+
+  # Analysis of Compositions of Microbiomes with Bias Correction (ANCOM-BC)
+  # in combination with transformed counts
+  # https://www.bioconductor.org/packages/release/bioc/vignettes/ANCOMBC/inst/doc/ANCOMBC.html
+  # https://www.tandfonline.com/doi/full/10.3402/mehd.v26.27663
+  # default p_adj is "holm"
+  # # Cutoff values for declaring differentially abundant taxa
+  # cut_off = 0.7 * (n_taxa - 1)
+  # For a given taxon, the output W statistic represents the number ALR transformed
+  # models where the taxon is differentially abundant with regard to the variable
+  # of interest. Larger the value of W, the more likely the taxon is differentially abundant.
+  set.seed(seed)
+  {tryCatch({
+    s <- Sys.time()
+    res.list[["ancombc"]] <- base::do.call(
+      microbiomeMarker::run_ancombc, c(list(ps.filt), fct_args_lin,
+                                       list(prv_cut = 0), list(conserve = TRUE)))
+    stat.list[[4]] <- calc_difft("ancombc")
+    }, error = function(e){cat("ERROR :",conditionMessage(e), "\n")})
+  }
+
+  
+  # metagenomeSeq differential analysis using
+  # "ZIG" (Zero-inflated Gaussian mixture model) model in combination with transformed counts
+  set.seed(seed)
+  {tryCatch({
+    s <- Sys.time()
+    res.list[["mgzig"]] <- base::do.call(
+      microbiomeMarker::run_metagenomeseq, c(list(ps.filt), fct_args_lin, list(method = "ZIG")))
+    stat.list[[5]] <- calc_difft("mgzig")
+    }, error = function(e){cat("ERROR :",conditionMessage(e), "\n")})
+  }
+  ## differential analysis with methods based on non-linear model
+  
+  ## subset phyloseq to contain only the variable factors to be compared
+  # remove samples for doing pairwise comparisons
+  # subset samples with 'base::get(var_test) %in% comp_pair' not working! 
+  # extract metadata for filtering
+  subset_ps <- function(ps, test.var, comp.pair) {
+    meta <- as.data.frame(phyloseq::sample_data(ps))
+    ps1 <- phyloseq::prune_samples(
+      stringr::str_detect(dplyr::pull(meta[, test.var]),
+                 paste(paste0("^", comp.pair, "$"), collapse = "|")), ps)
+    meta <- as.data.frame(phyloseq::sample_data(ps1))
+    meta[, test.var] <- droplevels(meta[, test.var])
+    meta[, test.var] <- forcats::fct_relevel(dplyr::pull(meta[, test.var]), rev(comp.pair))
+    sample_data(ps1) <- meta
+    return(ps1)
+  }
+  ps.ori1 <- subset_ps(ps = ps.ori.filt, test.var = var_test, comp.pair = comp_pair)
+  ps.trans1 <- subset_ps(ps = ps.filt, test.var = var_test, comp.pair = comp_pair)
+
+  ## define function parameters (non-linear models)
+  fct_args_nonlin <- list(var_test,
+                          norm = "none",
+                          taxa_rank = analysis_level
+  )
+  
+  # LDA Effect Size (LEfSe) method for microbiome biomarker discovery
+  # with certain data the method is very sensitive to the starting seed
+  # therefore, LEfSe is tried up to 20 times with different seeds
+  set.seed(seed)
+  lefse_counter <- 0
+  while(!exists("lefse") & lefse_counter < 20) {
+    s <- Sys.time()
+    {tryCatch({
+      if(lefse_counter != 0) {set.seed(seed = Sys.time())}  
+      lefse <- base::do.call(
+        microbiomeMarker::run_lefse, c(list(ps.ori1), fct_args_nonlin,
+                                       list(kw_cutoff = 1),
+                                       list(wilcoxon_cutoff = 1),
+                                       list(lda_cutoff = 0)))
+      res.list[["lefse"]] <- lefse
+      }, error = function(e){cat("ERROR :",conditionMessage(e), "\n")})}
+    
+    stat.list[[6]] <- paste(calc_difft("lefse"), ", Try:", lefse_counter + 1)
+    lefse_counter <- sum(lefse_counter, 1)
+  }
+  
+  # perform differential analysis using ALDEx2 in combination with raw reads
+  set.seed(seed)
+  {tryCatch({
+    s <- Sys.time()
+    res.list[["aldex"]] <- base::do.call(
+      microbiomeMarker::run_aldex,c(list(ps.ori1), fct_args_nonlin,
+                                                   list(p_adjust = padj_method),
+                                                   list(pvalue_cutoff = 1)))
+    stat.list[[7]] <- calc_difft("aldex")
+    }, error = function(e){cat("ERROR :",conditionMessage(e), "\n")})
+  }
+  
+  # perform differential analysis using ANCOM
+  set.seed(seed)
+  {tryCatch({
+    s <- Sys.time()
+    res.list[["ancom"]] <- base::do.call(
+      microbiomeMarker::run_ancom,c(list(ps.trans1), fct_args_nonlin,
+                                    list(p_adjust = padj_method), list(W_cutoff = 0)))
+    stat.list[[8]] <- calc_difft("ancom")
+    }, error = function(e){cat("ERROR :",conditionMessage(e), "\n")})
+  }
+  
+  # metagenomeSeq differential analysis using
+  # "ZIG" (Zero-inflated Gaussian mixture model) model
+  # https://support.bioconductor.org/p/94138/
+  set.seed(seed)
+  {tryCatch({
+    s <- Sys.time()
+    res.list[["mgziln"]] <- base::do.call(
+      microbiomeMarker::run_metagenomeseq, c(list(ps.trans1), fct_args_nonlin,
+                                             list(p_adjust = padj_method),
+                                             list(pvalue_cutoff = 1),
+                                             list(method = "ZILN")))
+    stat.list[[9]] <- calc_difft("mgziln")
+    }, error = function(e){cat("ERROR :",conditionMessage(e), "\n")})
+  }
+  
+  # ML-based analysis
+  set.seed(seed)
+  {tryCatch({
+    s <- Sys.time()
+    ml.out <- microbiomeMarker::run_sl(
+      ps.ori1,
+      group = var_test,
+      nfolds = 2, #2
+      nrepeats = 1, #1
+      taxa_rank = analysis_level,
+      top_n = 20,
+      norm = "CLR", # some methods do not work
+      method = "RF",
+      # https://www.rdocumentation.org/packages/ranger/versions/0.12.1/topics/ranger
+      importance = "impurity_corrected"#"impurity" "permutation" "impurity_corrected"
+    )
+    stat.list[[10]] <- calc_difft("ML")
+    }, error = function(e){cat("ERROR :",conditionMessage(e), "\n")})
+  }
+
+  ## return list of all results
+  return(list(
+    mm_data = res.list,
+    stat = stat.list,
+    ml_data = if(exists("ml.out")) ml.out else list(NULL)
+    ))
+}
+```
+
+
+### 5.3 Running times of DA analyses
+If enabled different comparisons are processed in parallel using multicore-enabled `mclapply` (Linux etc.) or `parLapply` (Windows) functions.
+
+```{r run_DA, echo = FALSE}
+# function to format total time difference
+total_DA_difft <- function(calc, start.t = st) {
+  x <- format_difftime(first = start.t, second = Sys.time())
+  return(paste0("All DA analyses were done in **", x, "** using ", calc))
+}
+
+# name of DA results file
+DA_results_file <- paste(
+  output_dir8, paste(ifelse(TU_type, "ZOTUs", "OTUs"), analysis_level, var_test, "rds", sep = "."), 
+  sep = "/")
+
+# do DA analyses using parallel processing
+if(!file.exists(DA_results_file)) {
+  if(useMC) {
+    if(.Platform$OS.type == "windows") {
+      st <- Sys.time()
+      # initiate clusters
+      cl <- parallel::makeCluster(num_cores, type = "PSOCK")
+      # everything created before starting clusters has to be exported
+      # export required libraries to the env of each cluster
+      parallel::clusterEvalQ(cl, c(library(microbiomeMarker), library(lattice),
+                                   library(caret), library(forcats),
+                                   library(phyloseq), library(stringr),
+                                   library(dplyr)))
+      # export required objects to the env of each cluster
+      parallel::clusterExport(cl, c("analysis_level", "var_test", "seed",
+                                    "ps.ori.filt", "ps.filt", "padj_method", 
+                                    "method_vec", "format_difftime"),
+                              envir = environment())
+      da_analyses.out <- parallel::parLapply(cl = cl, X = comp, fun = da_analyses)
+      # stop clusters
+      parallel::stopCluster(cl)
+      attr(da_analyses.out, "total_runtime") <- total_DA_difft("parLapply (parallel).")
+    } else {
+      # if on Linux / MacOS: use the more efficient 'mclapply'
+      st <- Sys.time()
+      da_analyses.out <- parallel::mclapply(comp, da_analyses, mc.cores = num_cores)
+      attr(da_analyses.out, "total_runtime") <- total_ax2_difft("mclapply (parallel).")
+    }
+  } else {
+    # use serial mode (no multicore)
+    st <- Sys.time()
+    da_analyses.out <- lapply(comp, da_analyses)
+    attr(da_analyses.out, "total_runtime") <- total_ax2_difft("lapply (serial).")
+  }
+  # export results as RDS file
+  saveRDS(da_analyses.out, file = DA_results_file)
+} else {
+  DA.res.present <- paste0(
+    "Results file: 'Differential_analysis_", analysis_level, "_", var_test,
+    ".rds' already present! Skip differential abundance analyses.")
+  da_analyses.out <- readRDS(DA_results_file)
+}
+
+# function to extract running times from results list
+
+x <- da_analyses.out
+i <- "WT_CD_vs_ref_ref"
+j <- 10
+extract.stats <- function(x) {
+  # prepare list
+  stat.list <- setNames(vector("list", length(x)), names(x))
+  for(i in names(x)) {
+    for(j in 1:10) {
+     stat.list[[i]][[j]] <- x[[i]][["stat"]][[j]] 
+    }
+  }
+  names(stat.list) <- stringr::str_replace(names(stat.list), "_vs_", " vs. ")
+  return(stat.list)
+}
+```
+`r if(exists("DA.res.present")) DA.res.present` The running times of the DA methods for the individual comparisons are shown below: 
+
+`r pander::pander(extract.stats(da_analyses.out))`
+
+`r attr(da_analyses.out, "total_runtime")`
+```{r taxa_df, echo = FALSE}
+### prepare taxa df
+# depending on analysis level a df is generated to include all available
+# taxonomic levels to which DA results are (left) joined
+if(analysis_level == "none") {
+  tax2 <- tax %>%
+    dplyr::select(Kingdom:Species, TU)
+} else if(!(analysis_level %in% c("all", "none"))) {
+  tax2 <- tax %>%
+    dplyr::distinct(dplyr::across(Kingdom:all_of(analysis_level)))
+} else if(analysis_level == "all") {
+  
+  # generate all possible taxa combinations
+  tax2 <- dplyr::bind_rows(
+    dplyr::distinct(tax, Kingdom) %>%
+      tibble::add_column(Phylum = NA, Class = NA, Order = NA, Family = NA, Genus = NA,
+                 Species = NA, TU = NA),
+    dplyr::distinct(tax, Kingdom, Phylum) %>%
+      tibble::add_column(Class = NA, Order = NA, Family = NA, Genus = NA, Species = NA,
+                 TU = NA),
+    dplyr::distinct(tax, Kingdom, Phylum, Class) %>%
+      tibble::add_column(Order = NA, Family = NA, Genus = NA, Species = NA, TU = NA),
+    dplyr::distinct(tax, Kingdom, Phylum, Class, Order) %>%
+      tibble::add_column(Family = NA, Genus = NA, Species = NA, TU = NA),
+    dplyr::distinct(tax, Kingdom, Phylum, Class, Order, Family) %>%
+      tibble::add_column(Genus = NA, Species = NA, TU = NA),
+    dplyr::distinct(tax, Kingdom, Phylum, Class, Order, Family, Genus) %>%
+      tibble::add_column(Species = NA, TU = NA),
+    dplyr::distinct(tax, Kingdom, Phylum, Class, Order, Family, Genus, Species, TU))
+  
+  # fill up missing TU values
+  allDuplicated <- function(vec){
+    front <- duplicated(vec)
+    back <- duplicated(vec, fromLast = TRUE)
+    all_dup <- front + back > 0
+    return(all_dup)
+  }
+  
+  tax2 <- tax2  %>%
+    mutate(
+      TU = dplyr::case_when(
+        !is.na(TU) ~ ifelse(str_detect(tax2$Species,
+                                       ifelse(TU_type, "s__Zotu", "s__OTU")), TU,
+                            stringr::str_match(Species,
+                                               ifelse(TU_type, "s__(.*)_Zotu", "s__(.*)_OTU"))[,2]),
+        !is.na(Genus) ~ Genus,
+        !is.na(Family) ~ Family,
+        !is.na(Order) ~ Order,
+        !is.na(Class) ~ Class,
+        !is.na(Phylum) ~ Phylum,
+        !is.na(Kingdom) ~ Kingdom),
+      TU = ifelse(allDuplicated(TU),
+                  paste0(TU, stringr::str_match(
+                    Species, ifelse(TU_type, ".*(_Zotu_[0-9]{1,5})",".*(_OTU_[0-9]{1,5})"))[,2]), TU)
+    )
+  
+  # make key for left_join with stat results
+  tax2$all <- dplyr::pull(
+    tidyr::unite(tax2 %>% dplyr::select(Kingdom:Species), "all", Kingdom:Species,
+          sep = "|", na.rm = TRUE))
+}
+```
+```{r extract_DA, echo = FALSE}
+# function to extract and plot DA data from microbiomeMarker objects
+# out.list <- da_analyses.out
+extract_plot_DA <- function(out.list) {
+  
+  # prepare lists to store results
+  da_data <- setNames(vector("list", length(out.list)), names(out.list))
+  da_plots <- da_data
+  
+  for(i in names(out.list)) {
+    # extract comparison pair
+    comp_pair <- unlist(stringr::str_split(i, "_vs_"))
+    # extract df
+    da_data[[i]] <- lapply(names(method_vec), function(x) {
+      
+      if(is.null(out.list[[i]][["mm_data"]][[x]])) {
+        return(NULL)
+      } else if(is.null(microbiomeMarker::marker_table(out.list[[i]][["mm_data"]][[x]]))) {
+        return(NULL)
+      } else {
+        
+            df <- out.list[[i]][["mm_data"]][[x]] %>%
+        microbiomeMarker::marker_table() %>%
+        as_tibble()
+      
+      # identify 'fold change' column
+      da_col <- str_subset(colnames(df), "^ef")
+      
+      # apply or correct direction of diff abundance:
+      # mgziln: 'enrich_group' is correct but sign (+/-) is SOMETIMES not
+      # aldex: 'enrich_group' is not correct but sign (+/-) is always OK
+      # lefse/ancom: only 'enrich_group' given, but no direction
+      # lefse/ancom: directly remove non-significant results
+      if(x == "lefse") {
+        df <- df %>%
+          mutate(ef_lda = ifelse(enrich_group == comp_pair[2], -1*ef_lda, ef_lda)) %>%
+          dplyr::filter(abs(ef_lda) > cutoff_lda,
+                        padj < cutoff_pval)
+      } else if(x == "ancom") {
+        df <- df %>%
+          mutate(ef_CLR_diff_mean = ifelse(enrich_group == comp_pair[2],
+                                           -1*ef_CLR_diff_mean, ef_CLR_diff_mean)) %>%
+          dplyr::filter(abs(ef_CLR_diff_mean) > log2(cutoff_fcda))
+      } else if(x == "mgziln") {
+        df <- mutate(df, {{da_col}} := ifelse(enrich_group == comp_pair[2],
+                                              -1*abs(df[[da_col]]), abs(df[[da_col]])))
+      }
+      
+      if(!(x %in% c("lefse", "ancom"))) {
+        df <- df %>%
+          mutate(sig = ifelse(padj < cutoff_pval & abs(.data[[da_col]]) > log2(cutoff_fcda),
+                              "sig", "not sig")) %>%
+          arrange(padj)
+      }
+      # remove 'enrich_group'
+      df <- dplyr::select(df, -enrich_group)
+      
+      #return df
+      return(df)
+    }})
+    names(da_data[[i]]) <- names(method_vec)
+    
+    # i <- "WT_diet_vs_WT_reference"
+    # x <- "lefse"
+    # do volcano / lefser plots
+    da_plots[[i]] <- lapply(names(method_vec), function(x) {
+      if(is.null(da_data[[i]][[x]])) {
+        return(NULL) 
+      } else if(x %in% c("lefse", "ancom")) {
+        lefserPlot2(df = da_data[[i]][[x]],
+                    method = x, comp_pair. = comp_pair, tax. = tax2)
+      } else {
+        plot_taxa_volcano(df = da_data[[i]][[x]],
+                          method = x, comp_pair. = comp_pair, tax. = tax2)
+      }})
+    names(da_plots[[i]]) <- names(method_vec)
+  }
+  return(list(
+    da_data = da_data,
+    da_plots = da_plots
+  ))
+}
+
+da_extract <- extract_plot_DA(da_analyses.out)
+```
+
+```{r sum_DA, echo = FALSE}
+# function to edit results df
+edit_result_df <- function(x) {
+  if(analysis_level == "all") {
+    df <- x %>% dplyr::select(-all)
+  }else df <- x
+  if(analysis_level %in% c("all", "none", "Species")) {
+    df <- df %>% mutate(across(Kingdom:Species, \(x) str_remove(x, "^[a-z]{1}__")))
+  } else {
+    df <- df %>% mutate(across(Kingdom:all_of(analysis_level), \(x) str_remove(x, "^[a-z]{1}__")))
+  }
+  return(df)}
+
+# filter/ summarize data
+summarize_DA_results <- function(out.list) {
+  
+  # define function for filtering results
+  filter_DA <- function(out.list, comp.) {
+    filt_list <- lapply(names(method_vec), function(x) {
+      #x = "lv"#"edger"   "lv"      "deseq2"  "ancom"   "ancombc" "lefse"   "aldex"   "mgzig"   "mgziln"
+      if(is.null(out.list[[comp.]][[x]])) {
+      return(NULL)
+      } else {
+      df <- out.list[[comp.]][[x]]
+      # identify 'fold change' column
+      da_col <- str_subset(colnames(df), "^ef")
+      
+      if(x == "lefse") {
+        df <- dplyr::filter(df, abs(.data[[da_col]]) > cutoff_lda, padj < cutoff_pval)
+      } else if(x == "aldex") {
+        df <- dplyr::filter(df, abs(.data[[da_col]]) > cutoff_aldex, padj < cutoff_pval) %>%
+          dplyr::select(-sig)
+      } else if(x == "ancom") {
+        # calculate threshold for W statistics
+        # W = number of features that a single feature is tested to be significantly different against
+        # threshold of 0.75 means that 75% of the total features are sign. different
+        W_threshold <- round(max(unlist(sapply(out.list[[comp.]], nrow)))*cutoff_W, 0)
+        df <- dplyr::filter(df, abs(.data[[da_col]]) > log2(cutoff_fcda) & W > W_threshold)
+      } else {
+        # edger lv deseq2 mgzig mgziln ancombc
+        df <- dplyr::filter(df, abs(.data[[da_col]]) > log2(cutoff_fcda), padj < cutoff_pval) %>%
+          dplyr::select(-sig)
+      }
+      df <- dplyr::rename_with(df, paste0, !all_of("feature"), paste0("_", x))
+      }})
+  # return list with empty slots removed
+  names(filt_list) <- names(method_vec)
+  return(filt_list[lengths(filt_list) > 0])
+  }
+  
+  # prepare list to store results
+  da_sum <- setNames(vector("list", length(out.list)), names(out.list))
+
+  # loop through all comparisons
+  for(i in names(out.list)) {
+    da_sum[[i]] <- purrr::reduce(
+      c(list(tax2), filter_DA(out.list, comp. = i)),
+      dplyr::left_join, by = if(analysis_level == "none"){setNames("feature", "TU")
+      } else {setNames("feature", analysis_level)}) %>%
+      edit_result_df()  %>% 
+      mutate(number_sig = rowSums(!is.na(dplyr::select(., starts_with("ef"))))) %>%
+      dplyr::filter(number_sig != 0) %>%
+      arrange(desc(number_sig), Phylum, Class)
+  }
+  return(da_sum)
+}
+
+da_summary <- summarize_DA_results(da_extract[["da_data"]])
+```
+
+
+```{r sum_ml, echo = FALSE}
+# function to extract and summarize ML results
+summarize_ML_results <- function(out.list) {
+  # prepare list to store results
+  ml_sum <- setNames(vector("list", length(out.list)), names(out.list))
+  for(i in names(out.list)) {
+    if(!is.null(unlist(out.list[[i]][["ml_data"]]))){
+      ml_sum[[i]] <- tax2 %>%
+        dplyr::left_join(microbiomeMarker::marker_table(out.list[[i]][["ml_data"]]),
+                  by = if(analysis_level == "none"){setNames("feature", "TU")
+      } else {setNames("feature", analysis_level)}) %>%
+        edit_result_df() %>%
+        dplyr::filter(!is.na(ef_imp)) %>%
+        dplyr::arrange(desc(ef_imp))
+    }
+  }
+  return(ml_sum)
+}
+
+# summarize ML data and remove list entries without data
+ml_summary <- summarize_ML_results(da_analyses.out)
+ml_summary <- ml_summary[lengths(ml_summary) > 0]
+
+```
+\newpage
+## 6. Visualize results
+
+### 6.1 Summarize DA results with heat trees
+The R package [`metacoder`](https://grunwaldlab.github.io/metacoder_documentation/) is used to plot the results of the differential abundance analyses as 'heat trees' together with a 'key tree' showing the taxonomic relationships.
+
+`r if (analysis_level != "all") paste("**Metacoder plots require differential abundance analysis at 'all' taxonomic levels.**")`
+
+```{r metacoder, eval = analysis_level == "all", echo = FALSE, message = FALSE, results = 'hide'}
+incProgress(1/7, message = "Calculate and plot heat trees...")
+mc_env <- import_DA_metacoder(ps.ori.filt, da_analyses.out,
+                                           cutoff.pval = cutoff_pval,
+                                           cutoff.fcda = cutoff_fcda,
+                                           cutoff.lda = cutoff_lda,
+                                           cutoff.W = cutoff_W,
+                                           cutoff.aldex = cutoff_aldex)
+
+# check whether failed or zero-significant results methods had to be completed
+if(!is.null(attr(metacoder:::get_taxmap_table(mc_env, "diff_table"), "completed"))) {
+  compl_comps <- attr(metacoder:::get_taxmap_table(mc_env, "diff_table"), "completed") 
+}
+# agglomerate at specified taxonomic level
+if (is.null(metacoder_tax)) {
+  mc_env_agg <- mc_env
+} else {
+  mc_env_agg <- mc_env %>%
+    metacoder::filter_taxa(taxon_ranks == metacoder_tax, supertaxa = TRUE, reassign_obs = FALSE) 
+}
+# make combined metacoder plots
+# diverging palettes
+# https://colorspace.r-forge.r-project.org/articles/hcl_palettes.html
+metacoder_out <- mc_env_agg %>%
+  mutate_obs("cleaned_names", gsub(taxon_names, pattern = "\\[|\\]|^[a-z]{1}__|__$", replacement = "")) %>%
+  heat_tree_matrix_DA(
+    data = "diff_table",
+    node_size = tu_number,
+    node_label = cleaned_names,
+    node_color = diffabund,
+    node_color_trans = "linear",
+    node_size_axis_label = paste("Number of", ifelse(TU_type, "ZOTUs/ASVs", "OTUs")),
+    node_color_axis_label = "Differential abundance",
+    node_color_range = colorspace::diverging_hcl(7, palette = "Blue-Red2"),
+    label_small_trees = FALSE,
+    small_trees = "methods",#"comparisons",#"summary",
+    tax_level = metacoder_tax,
+    key_size = 0.5,
+    seed = seed,
+    layout = "da",
+    initial_layout = "re",
+    export_dir = output_dir8,
+    TU_type = TU_type,
+    useMC = useMC
+  )
+
+# make summary metacoder plot
+mc_summary <- mc_env_agg %>%
+  mutate_obs("cleaned_names", gsub(taxon_names, pattern = "\\[|\\]|^[a-z]{1}__|__$|^.*s__", replacement = "")) %>%
+  heat_tree_matrix_DA(
+    data = "diff_summary",
+    node_size = tu_number1,
+    node_label = cleaned_names,
+    node_color = n_sig,
+    node_color_trans = "linear",
+    node_size_axis_label = "Number of OTUs",
+    node_color_axis_label = "Sig. methods",
+    node_color_range = colorspace::diverging_hcl(7, palette = "Green-Orange"),
+    label_small_trees = FALSE,
+    small_trees = "summary", #"methods",#"comparisons",#"summary",
+    tax_level = metacoder_tax,
+    key_size = 0.5,
+    seed = seed,
+    layout = "da",
+    initial_layout = "re",
+    export_dir = output_dir8,
+    TU_type = TU_type,
+    useMC = FALSE # there is only one 'category'
+  )
+
+# export fig legends and paths as character vectors
+metacoder_figs <- list()
+metacoder_legends <- list()
+for(k in names(metacoder_out)) {
+    metacoder_figs[[k]] <- attr(metacoder_out[[k]][["matrix_pt"]], "file_name")
+    metacoder_legends[[k]] <- attr(metacoder_out[[k]][["matrix_pt"]], "fig_legend")
+}
+
+metacoder_figs <- unlist(metacoder_figs)
+metacoder_legends <- unlist(metacoder_legends)
+
+mc_summary_fig <- attr(mc_summary[["summary"]][["matrix_pt"]], "file_name")
+mc_summary_legend <- attr(mc_summary[["summary"]][["matrix_pt"]], "fig_legend")
+```
+`r if (exists("compl_comps")) paste("Due to failed methods, the following combinations of method and contrast have been completed with non-significant data (differential abundance = 0, p = 1)")`
+```{r completed_data, eval = exists("compl_comps"), echo = FALSE}
+ kbl(compl_comps, caption = paste("Completed 'missing' contrast/method combinations for metacoder heat trees."),
+ booktabs = TRUE, linesep = "", digits = 3, format.args = list(big.mark = ",")) %>%
+ kable_styling(latex_options = c("striped", "HOLD_position"))
+```
+#### 6.1.1 Heat trees of each method / contrast      
+
+`r attr(metacoder_out, "total_runtime")` For each comparison / contrast, the results of individual methods are depicted together as heat trees below.
+```{r metacoder_overviews, eval = analysis_level == "all", echo = FALSE, out.width = "100%", fig.width = 7.7, fig.height = 7.7, fig.cap = metacoder_legends}
+knitr::include_graphics(metacoder_figs)
+```
+\newpage
+#### 6.1.2 Heat trees summarizing all methods for each contrast      
+
+`r attr(mc_summary, "total_runtime")` As a summary, cumulative significant hits across all methods are depicted as heat trees for all contrasts.
+```{r metacoder_summary, eval = analysis_level == "all", echo = FALSE, out.width = "100%", fig.width = 7.7, fig.height = 7.7, fig.cap = mc_summary_legend}
+knitr::include_graphics(mc_summary_fig)
+```
+### 6.2 Summarize data in UpSet plots
+[UpSet plots](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4720993/) are used to visualize intersections in the results of the 
+different DA methods.
+```{r upset_fct, echo = FALSE, results = 'hide', fig.show = 'hide'}
+
+# function to loop through all comparisons
+generate_upsets <- function(l) {
+  require("UpSetR")
+  require("grid")
+  require("ggplotify")
+  # prepare list to store upset plots for each comparison
+  ups.list <- setNames(
+    vector("list", length(comp)),
+    names(comp)
+  )
+  # function to rename columns
+  rename_cols <- function(x) {
+    colvec <- c("ef_logFC_edger" = "EdgeR", "ef_logFC_lv"= "limma (voom)",
+                "ef_logFC_deseq2" = "DESeq2", "ef_CLR_diff_mean_ancom" = "ANCOM",
+                "ef_W_ancombc" = "ANCOM-BC", "ef_lda_lefse" = "LEfSe",
+                "ef_aldex_aldex" = "ALDEx2", "ef_logFC_mgzig" = "metag (ZIG)",
+                "ef_logFC_mgziln" = "metag (ZILN)")
+    return(colvec[x])
+  }
+  # loop through list
+  for (v in names(comp)) {
+    # prepare data for upset plot
+    updf <- l[[v]] %>%
+      dplyr::select(starts_with("ef")) %>%
+      rename_with(rename_cols) %>%
+      mutate(across(everything(), ~ifelse(!is.na(.), 1, 0))) %>%
+      as.data.frame()
+    
+    if (nrow(updf) > 0) {
+      # identify set(s) with maximum overlap
+      # https://cran.r-project.org/web/packages/UpSetR/vignettes/queries.html
+      
+      get_queries <- function(df) {
+        
+        # identify max overlaps in sets
+        sets <- df[rowSums(df) == max(rowSums(df)), ] %>%
+          dplyr::select(where( ~ is.numeric(.x) && sum(.x) != 0)) %>% dplyr::distinct() %>%
+          t() %>% as.data.frame() %>% rownames_to_column("method")
+        
+        # initiate list to store queries
+        query.list <- vector("list", ncol(sets)-1)
+        
+        # loop through max overlaps with different composition
+        for(j in 2:ncol(sets)) {
+          query.list[[j-1]] <- list(
+            query = intersects,
+            params = list(sets[sets[, j] == 1, "method"]),
+            color = "red", active = TRUE
+          )
+        }
+        return(query.list)
+      }
+      # do UpSet plot
+      uppt <- UpSetR::upset(data = updf,
+                            queries = get_queries(updf),
+                            nintersects = nrow(dplyr::distinct(updf)),
+                            nsets = ncol(updf), order.by = "freq", point.size = 2.5, line.size = 1,
+                            mainbar.y.label = "Differential Abundance Method Intersections",
+                            sets.x.label = "Differentially Abundant Taxa Identified",
+                            text.scale = c(1.2, 1.2, 1, 1, 1.5, 1))
+      
+      # convert upset to ggplot and add title to plot
+      print(uppt)
+      grid.edit('arrange', name = v)
+      ups.list[[v]] <- ggplotify::as.ggplot(grid::grid.grab()) +
+        ggtitle(paste("Comparison:", str_replace(v, "_vs_", " vs. "))) +
+        theme(plot.title = element_text(hjust = 0.5)) 
+    } else ups.list[[v]] <- NULL
+  }
+  return(ups.list)
+}
+# store UpSet plots in list
+upsets <- generate_upsets(da_summary)
+```
+### 6.3 Plot overviews for each contrast
+Overviews are generated for each contrast by combining the UpSet plot with the corresponding volcano plots. 
+```{r combine_plts, echo = FALSE}
+incProgress(1/7, message = "Plotting UpSet plot and volcano plots...")
+# function to combine UpSet plots with volcano plots
+combine_DA_plots <- function(uplist, volclist) {
+  require(patchwork)
+  # initialize list to store results
+  comp.list <- setNames(
+    vector("list", length(names(comp))),
+    names(comp)
+  )
+  for (v in names(upsets)) {
+    ## combine upset with volcano plots
+    # https://stackoverflow.com/questions/69644490/center-tags-of-nested-plot-using-ggplot-and-patchwork
+    # subset list
+    allplots <- volclist[[v]][c("edger","lv","deseq2","ancombc",
+                                "aldex","mgzig","mgziln")]
+    #  remove empty list slots
+    allplots <- allplots[lengths(allplots) > 0]
+    
+    # combine all plots
+    ov <- (uplist[[v]] +
+             plot_layout(
+               widths = unit(c(36), c('cm'))
+             )) / 
+      (wrap_plots(allplots) +
+         guide_area() + 
+         plot_layout(
+           ncol = 3,
+           widths = unit(c(11), c('cm')),
+           guides = 'collect'
+         )) +
+      plot_layout(heights = c(1,2.5))
+    ov <- ov + plot_annotation(tag_levels = 'A')
+    
+    # export combined upset/volcano plots
+    file_name <- paste(output_dir8, paste(
+      ifelse(TU_type, "ZOTUs", "OTUs"), analysis_level, 
+      var_test, v, "overview", "png", sep = "."), sep = "/")
+    attr(ov, "file_name") <- file_name
+    attr(ov, "fig_legend") <- paste0(
+      "Overview of differential abundance (DA) analyses comparing factors '",
+      str_replace_all(str_replace(v, "_vs_" , "' vs. '"), "_", "\\\\_"),
+      "' of variable '", str_replace_all(var_test, "_", "\\\\_"),
+      "'. (A) UpSet plot summarizing the significant results of DA analyses. In (B-H) volcano plots of the results obtained by the methods indicated are shown. All analyses were done at taxonomy level: '", analysis_level, "'.")
+    
+    ggsave(filename = file_name,
+           plot = ov,
+           width = 42, height = 60, units = "cm",
+           bg = "white")
+    
+    comp.list[[v]] <- ov
+  }
+  return(comp.list)
+}
+overviews <- combine_DA_plots(uplist = upsets,
+                              volclist = da_extract[["da_plots"]])
+# remove empty list slots
+overviews <- overviews[lengths(overviews) != 0]
+
+# extract file names and figure legends
+upset_figs <- sapply(overviews, attr, "file_name")
+upset_legends <- sapply(overviews, attr, "fig_legend")
+```
+```{r upset_overviews, echo = FALSE, out.height = "93%", fig.width = 7.5, fig.height = 9, fig.cap = upset_legends}
+knitr::include_graphics(upset_figs)
+```
+## 7. Data export
+
+### 7.1 Export plots
+
+Function to export all plots stored in results list:
+```{r export_plots}
+incProgress(1/7, message = "Saving...")
+# function for export
+export_DA_plots <- function(l) {
+  # v <- "WT_diet_vs_WT_reference"
+  for (v in names(l)) {
+    # remove empty list slots
+    l1 <- Filter(length, l[[v]])
+    for (i in names(l1)) {
+      if(i %in% c("ancom", "lefse")) {
+        ggsave(filename = 
+                 paste(output_dir8, "DA_analysis/figures", paste(
+                   ifelse(TU_type, "ZOTUs", "OTUs"), analysis_level, 
+                   var_test, v, i, "png", sep = "."), sep = "/"),
+               plot = l1[[i]],
+               width = attr(l1[[i]], "plot_width"),
+               height = attr(l1[[i]], "plot_height"),
+               bg = "white", limitsize = FALSE, dpi = 300)
+      } else {
+        pt1 <- fix_ggplot_panel(l1[[i]], p.width = 12, p.height = 12, p.margin = 12)
+        ggsave(filename = 
+                 paste(output_dir8, paste(
+                   ifelse(TU_type, "ZOTUs", "OTUs"), analysis_level, 
+                   var_test, v, i, "png", sep = "."), sep = "/"),
+               plot = pt1,
+               width = attr(pt1, "plot_width"),
+               height = attr(pt1, "plot_height"),
+               bg = "white", dpi = 300)
+      }
+    }
+  }
+}
+# export plots
+export_DA_plots(da_extract[["da_plots"]])
+```
+All figures were exported to the following folder:
+
+\footnotesize
+``r paste(output_dir8, "DA_export/DA", sep = "/")``
+\normalsize
+
+### 7.2 Export data
+```{r export_data, echo = FALSE}
+# set file name and path
+file_name <- paste(ifelse(TU_type, "ZOTUs", "OTUs"), "DA_summary",
+                   analysis_level, var_test, sep = ".")
+file_path <- paste(output_dir8, file_name, sep = "/")
+
+# if not existing, export all data as rds
+if(!file.exists(paste0(file_path, ".rds"))) {
+  saveRDS(list(
+    # data = da_extract[["da_data"]],
+    data_summary = da_summary,
+    ml_summary = ml_summary,
+    # plots = da_extract[["da_plots"]],
+    plots_overviews = overviews,
+    mc_env = mc_env
+    # mc_plots = metacoder_out,
+    # mc_summary = mc_summary[["summary"]]
+  ), file = paste0(file_path, ".rds"))
+}
+
+# export summary dfs to Excel
+writexl::write_xlsx(ml_summary, path = paste0(file_path, ".ML.xlsx"))
+writexl::write_xlsx(da_summary, path = paste0(file_path, ".xlsx"))
+```
+
+Summarized data is exported in two Excel-files:
+
+* ``r paste0(file_name, ".xlsx")`` (summarized DA results)
+* ``r paste0(file_name, "_ML.xlsx")`` (summarized ML results) 
+
+The summary data as well as the `metacoder` environment is exported as `rds` file:
+
+* ``r paste0(file_name, ".rds")``
+
+\newpage
+## Record session information
+\tiny
+```{r session_info, echo = FALSE}
+print(sessionInfo())
+```

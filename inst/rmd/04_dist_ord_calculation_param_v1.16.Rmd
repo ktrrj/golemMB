@@ -1,0 +1,534 @@
+---
+title: "Calculation of distance matrices and ordination"
+author: "`r params$author`"
+date: "`r format(Sys.time(), '%d.%m.%y')`"
+header-includes:
+- \usepackage{float} #use the 'float' package
+- \floatplacement{figure}{H} #make every figure with caption = h
+- \usepackage{flafter}
+- \usepackage{booktabs}
+- \usepackage{longtable}
+- \usepackage{array}
+- \usepackage{multirow}
+- \usepackage{wrapfig}
+- \usepackage{colortbl}
+- \usepackage{pdflscape}
+- \usepackage{tabu}
+- \usepackage{threeparttable}
+- \usepackage{threeparttablex}
+- \usepackage[normalem]{ulem}
+- \usepackage{makecell}
+- \usepackage{xcolor}
+output:
+  pdf_document:
+    latex_engine: lualatex
+    fig_width: 24
+    fig_height: 31
+    fig_caption: yes
+    df_print: kable
+    extra_dependencies: ["float"]
+    includes:
+      in_header: header.tex
+  word_document: default
+  html_document:
+    df_print: kable
+    theme: cerulean
+    highlight: haddock
+    toc: yes
+    toc_depth: 3
+    toc_float: TRUE
+    collapsed: FALSE
+    smooth_scroll: TRUE
+    code_fold: show
+params:
+  author:
+    label: "author of the analysis"
+    value: "no author given"
+  workdir:
+    label: "working directory"
+    value: "U:/00_Shiny/Test"
+  TU_type:
+    label: "type of taxonomic units analyzed"
+    value: "OTU"
+  var_test:
+    label: "metadata variable used for plotting"
+    value: NULL
+  var_name:
+    label: "variable name for plotting"
+    value: NULL
+  shape_var:
+    label: "optional variable to use for point shape"
+    value: NULL
+  color_set:
+    label: "define colors, optionally as named vector"
+    value: !r NULL
+  label_set:
+    label: "named vector for plot labels"
+    value: !r NULL
+fontsize: 10pt
+urlcolor: blue
+papersize: a4
+editor_options: 
+  chunk_output_type: console
+---
+```{r version, echo = FALSE}
+script_version <- "1.16"
+#script_date <- file.info("C:\\MyFolder\\test.csv")$mtime
+```
+This is 'Calculation of distance matrices and ordination' script version **`r script_version`** by Dr. Roman Gerlach.
+
+## Load required libraries
+```{r libraries, warning = FALSE, message = FALSE}
+setProgress(1/10, message = "Loading required libraries...")
+library(tidyverse)
+library(ggtext)
+library(doParallel)
+library(phyloseq)
+library(vegan)
+library(GUniFrac)
+library(Rtsne)
+library(umap)
+library(egg)
+library(patchwork)
+suppressWarnings(library(kableExtra))
+library(pander)
+library(rmarkdown)
+```
+```{r global_options, echo = FALSE}
+# Set up global options for nice reports and keeping figures:
+knitr::opts_chunk$set(fig.width = 24, fig.height = 31, fig.align = "center",
+                      out.extra = "", warning = FALSE, message = FALSE,
+                      fig.pos = "!H", cache.path = params$workdir,
+                      dev = "cairo_pdf")
+options(knitr.kable.NA = '')
+```
+## Setting up environment and script parameters
+```{r environment, echo = FALSE}
+# setting TU type
+TU_type <- ifelse(params$TU_type == "OTU", FALSE, TRUE)
+
+# source required functions
+# source("../helper_functions/functions_accessory.R", local = knitr::knit_global())
+
+set.seed(42)
+```
+```{r plot_parameters, echo = FALSE}
+var_test <- params$var_test
+var_name <- params$var_name
+shape_var <- params$shape_var
+color_set <- params$color_set 
+label_set <- params$label_set
+```
+Type of imported taxonomic units (TUs)
+
+`r ifelse(TU_type, paste0("Taxonomic data is present in the form of **ZOTUs/ASVs** (Zero-radius Operational Taxonomic Units/Amplicon Sequence Variants)"), paste0("Taxonomic data is present in the form of **OTUs** (Operational Taxonomic Units)"))`
+
+Set variables for plotting: 
+
+* var_test    = **`r pander::pander(var_test)`**
+* var_name    = **`r pander::pander(var_name)`**
+* shape_var   = `r ifelse(!is.null(shape_var), paste0("**", pander::pander(shape_var), "**"), "**none**")`
+
+color_set:
+`r show_color_set(color_set)`
+
+label_set:
+`r show_label_set(label_set)`
+
+```{r data_import, echo = FALSE}
+incProgress(1/10, message = "Importing transformed data...")
+# file names
+trans_tu_file <- ifelse(TU_type, input$uploadZOTUtrans$datapath, input$uploadOTUtrans$datapath)
+trans_genus_file <- ifelse(TU_type, input$uploadZOTUtransgenus$datapath, input$uploadOTUtransgenus$datapath)
+
+# import rds files
+trans_otus  <- readRDS(trans_tu_file)
+trans_genus <- readRDS(trans_genus_file)
+```
+
+```{r debugging, eval=FALSE, echo=FALSE}
+# source required functions
+# source("../helper_functions/functions_accessory.R", local = knitr::knit_global())
+# setting TU type
+# TU_type <- ifelse(params$TU_type == "OTU", FALSE, TRUE)
+TU_type <- TRUE
+# file names
+trans_tu_file <- paste0("transform_list_", ifelse(TU_type, "zotu", "otu"), ".rds")
+trans_genus_file <- paste0("transform_list_genus_", ifelse(TU_type, "zotu", "otu"), ".rds")
+trans_otus  <- readRDS(file = paste0(workdir, "/data/", trans_tu_file))
+trans_genus <- readRDS(file = paste0(workdir, "/data/", trans_genus_file))
+```
+### Import list of phyloseq objects 
+All `r ifelse(TU_type, "ZOTU/ASV", "OTU")` count transformations:  ``r trans_tu_file`` 
+All genus count transformations: ``r trans_genus_file``  
+
+## Calculate distance matrices of samples stored in phyloseq objects
+Calculation is done for both, `r ifelse(TU_type, "ZOTU/ASV", "OTU")`- and genus counts after sample filtering (removal of excluded samples and outliers). Count data is either used without normalization (original counts) or normalized to relative abundance (ra), log-transformed (log), Hellinger standardized (hel), relative log expression (RLE), variance stabilizing transformation (vst) or to modified centered log-ratio (CLR) -transformed counts. To calculate distances between samples functions implemented via the [vegan](https://cran.r-project.org/web/packages/vegan/index.html) package are used. To calculate UniFrac distance matrices, the package [GUniFrac](https://cran.r-project.org/web/packages/GUniFrac/index.html) is used.
+```{r dist_calc}
+incProgress(1/10, message = "Calculating distance...")
+
+# function to calculate distances
+calc_distances <- function(phylo_obj) {
+  # list to store data
+  dist_methods <- c("meta", "otu", "uni", "wuni", "vawuni", "guni",
+                    "dpcoa", "bray", "gower", "jsd")
+  dist <- setNames(vector("list", length(dist_methods)),
+      dist_methods)
+  
+  # compute various distances (adonis)
+  # dist[["dpcoa"]] <- phyloseq::distance(phylo_obj, method = "dpcoa")
+  dist[["bray"]] <- phyloseq::distance(phylo_obj, method = "bray")
+  dist[["gower"]] <- phyloseq::distance(phylo_obj, method = "gower")
+  dist[["jsd"]] <- phyloseq::distance(phylo_obj, method = "jsd")
+  
+  # compute unweighted, weighted, variance-adjusted-weighted
+  # and generalized UniFrac distances (GUniFrac)
+  unifracs <- GUniFrac::GUniFrac(base::as.data.frame(base::t(phyloseq::otu_table(phylo_obj))),
+                                 phyloseq::phy_tree(phylo_obj),
+                                 alpha = c(0,0.5,1))$unifracs
+  dist[["uni"]] <- stats::as.dist(unifracs[, , "d_UW"])
+  dist[["wuni"]] <- stats::as.dist(unifracs[, , "d_1"])
+  dist[["vawuni"]] <- stats::as.dist(unifracs[, , "d_0"])
+  dist[["guni"]] <- stats::as.dist(unifracs[, , "d_0.5"])
+  
+  # remove distance matrices containing NAs
+  dist <- dist[base::sapply(dist, function(x) {!(any(is.na(x)))})]
+  
+  # extract metadata and ZOTU/OTU table
+  dist[["meta"]] <- as(phyloseq::sample_data(phylo_obj), "data.frame")
+  dist[["otu"]] <- base::as.data.frame(base::t(phyloseq::otu_table(phylo_obj))) 
+  
+  # remove empty list slots
+  dist <- dist[lengths(dist) > 0]
+  dist
+}
+
+# TUs file name
+dists_file_otus <- paste0(output_dir4,"/dists_list_",
+                          ifelse(TU_type, "zotu", "otu"), ".rds")
+# calculate distances for TU counts
+dists_otus <- lapply(trans_otus, calc_distances)
+
+
+# genus file name
+dists_file_genus <- paste0(output_dir4,"/dists_list_genus_",
+                           ifelse(TU_type, "zotu", "otu"), ".rds")
+# calculate distances for genus counts
+dists_genus <- lapply(trans_genus, calc_distances)
+```
+## Export distance data as lists in RDS format
+```{r export_dists, echo = FALSE}
+incProgress(1/10, message = "Saving distance matrices...")
+# ..for ZOTU/OTU counts
+saveRDS(dists_otus, file = dists_file_otus)
+
+# ..for genus counts
+saveRDS(dists_genus, file = dists_file_genus)
+
+```
+The distance matrices were exported to the following files:
+\footnotesize
+* ``r dists_file_otus``
+* ``r dists_file_genus``
+
+\normalsize
+## Evaluate cluster separation depending on normalization and distance matrix calculation method
+All previously calculated distance matrices are evaluated using the cluster.stats function from the [fpc package](https://cran.r-project.org/web/packages/fpc/index.html). For that the `r length(unique(pull(phyloseq::sample_data(trans_otus[["ori"]])[, var_test])))` experimental groups defined by the *var_test* variable are used for artificial cluster assignment. The following parameters are shown:
+
+* pearson.gamma = correlation between distances and a 0-1-vector where 0 means same cluster, 1 means different clusters. "Normalized gamma" in [Halkidi *et al*. (2001)](https://link.springer.com/article/10.1023/A:1012801612483).
+* avg.silwidth = The **average silhouette width** of all clusters. The [silhouette width](https://www.sciencedirect.com/science/article/pii/0377042787901257) is a measure of how similar an object is to its own cluster (cohesion) compared to other clusters (separation). The silhouette ranges from -1 to +1, where a high value indicates that the object is well matched to its own cluster and poorly matched to neighboring clusters.
+* sindex = The **separation index** is based on the distances for every point to the closest point not in the same cluster. The separation index is then the mean of the smallest proportion sepprob of these.
+* wb.ratio = The **within between ratio** is the average distance within clusters / average distance between clusters.
+* ch = **C**alinski and **H**arabasz index [Calinski and Harabasz (1974)](https://www.tandfonline.com/doi/abs/10.1080/03610927408827101)
+
+\newpage
+```{r cluster_stats, echo = FALSE}
+incProgress(1/10, message = "Evaluating cluster separation...")
+# https://mhahsler.github.io/Introduction_to_Data_Mining_R_Examples/book/clustering-analysis.html
+extract_clust_stats <- function(dists_list, physeq_list) {
+  norm_methods <- names(dists_list)
+  cl.stats <- setNames(vector("list", length(norm_methods)),
+      norm_methods)
+  for(i in norm_methods) {
+  # remove non-dist objects from list
+  dists <-  within(dists_list[[i]], rm(list = c("meta", "otu"))) 
+  cl.stat <- purrr::imap(dists, ~ fpc::cluster.stats(d = .x,
+  # use experimental groups as defined by 'var_test' as artificial cluster
+  as.numeric(pull(phyloseq::sample_data(physeq_list[[i]])[, var_test]))))
+  cl.stats[[i]] <- purrr::imap_dfr(cl.stat, ~ c(
+        "normalization" = i,
+        "dist.method" = .y,
+        "pearson.gamma" = .x[["pearsongamma"]],
+        "avg.silwidth" = .x[["avg.silwidth"]],
+        "sindex" = .x[["sindex"]],
+        "wb.ratio" = .x[["wb.ratio"]],
+        "ch" = .x[["ch"]])
+        )
+  }
+  z <- bind_rows(cl.stats) %>%
+    dplyr::mutate(across(3:7, as.numeric),
+           across(where(is.numeric), round, 3)) %>%
+    arrange(desc(pearson.gamma), desc(avg.silwidth))
+}
+
+otu_clust_stats <- extract_clust_stats(dists_otus, trans_otus)
+genus_clust_stats <- extract_clust_stats(dists_genus, trans_genus)
+```
+```{r cluster_stats_table1, echo = FALSE}
+# display TU df using kable
+kbl(head(otu_clust_stats, 20), caption = paste(
+  "The 20 combinations of", ifelse(TU_type, "ZOTU/ASV", "OTU"), "count normalization and methods for distance matrix calculation (dist.method) with highest Pearson gamma (pearson.gamma) and average silouhette width (avg.silwidth) are shown"), booktabs = TRUE,
+    linesep = "", format.args = list(big.mark = ",")) %>%
+kable_styling(latex_options = c("striped", "HOLD_position"))
+```
+```{r cluster_stats_table2, echo = FALSE}
+# display genus df using kable
+kbl(head(genus_clust_stats, 20), caption = paste("The 20 combinations of genus count normalization and methods for distance matrix calculation (dist.method) with highest Pearson gamma (pearson.gamma) and average silouhette width (avg.silwidth) are shown"), booktabs = TRUE,
+    linesep = "", format.args = list(big.mark = ",")) %>%
+kable_styling(latex_options = c("striped", "HOLD_position"))
+```
+\newpage
+## Calculate ordination
+All count normalization methods of `r ifelse(TU_type, "ZOTU/ASV", "OTU")` and genus counts combined with Jensen–Shannon divergence (JSD), Gower’s, Bray-Curtis, Double Principle Coordinate Analysis (DPCoA), unweighted, weighted,  variance-adjusted weighted and generalized UniFrac distances are subjected to ordination. Here, Multidimensional Scaling (MDS) / Principal Coordinate Analysis (PCoA), Non-metric Multidimensional Scaling (NMDS), t-distributed Stochastic Neighbor Embedding (t-SNE) (via the [Rtsne package](https://github.com/jkrijthe/Rtsne)) and Uniform Manifold Approximation and Projection (UMAP) (via the [umap package](https://cran.r-project.org/web/packages/umap/vignettes/umap.html))are used. These are all unconstrained ordination techniques to aid the visualization of high dimensional data. In contrast to PCA (principal component analysis), which uses always euclidean distance, other distance matrices (see above) can be specified when using these methods.
+```{r calc_ordination, results = 'hide'}
+incProgress(1/10, message = "Calculating ordination...")
+# function to batch calculate all ordinations
+# phylo_obj <- trans_otus[["ori"]]
+calc_ordination <- function(phylo_obj) {
+  # https://microbiome.github.io/tutorials/Ordination.html
+  # https://microbiome.github.io/tutorials/Landscaping.html
+  # function to calculate and export tSNE
+    calc_tsne <- function(ps = phylo_obj, dist.m, perp_value = perp) {
+                 tsne_out <- Rtsne::Rtsne(X = dist.m, perplexity = perp_value,
+                                  is_distance = TRUE, num_threads = 0, dims = 2)
+                 base::rownames(tsne_out$Y) <- base::colnames(phyloseq::otu_table(ps))
+                 tsne_out
+    }
+  # function to calculate and export UMAP
+    calc_umap <- function(dist.m) {
+      #help(umap.defaults)
+      custom.config <- umap::umap.defaults
+      custom.config$random_state <- 42
+      custom.config$input <- "dist"
+      umap_out <- umap::umap(base::as.matrix(dist.m), config = custom.config)
+      return(umap_out)
+    }
+    
+  # function to check for NA in distance matrix
+    # check_na <- function(x) {any(!is.na(x))}
+    check_na <- function(x) {!(any(is.na(x)))}
+  
+  #list to store data
+  ord_methods <- c("MDS", "NMDS", "tSNE", "UMAP")
+  dist_methods <- c("bray", "jsd", "gower", "wuni", "vawuni", "guni")
+  # dist_methods <- c("bray", "uni", "wuni", "vawuni", "guni", "dpcoa")
+  ord <- stats::setNames(base::vector("list", base::length(ord_methods)*base::length(dist_methods)),
+                  base::paste(ord_methods, base::rep(dist_methods, each = base::length(ord_methods)),
+                        sep = "."))
+  # Bray Curtis distance
+  bray.dist <- phyloseq::distance(phylo_obj, method = "bray")
+  if (check_na(bray.dist)) {tryCatch({
+    perp <- (attr(bray.dist, "Size")-1) / 3
+    ord[["MDS.bray"]] <- phyloseq::ordinate(phylo_obj, method = "MDS", distance = bray.dist)
+    ord[["NMDS.bray"]] <- phyloseq::ordinate(phylo_obj, method = "NMDS", distance = bray.dist)
+    ord[["tSNE.bray"]] <- calc_tsne(dist.m = bray.dist)
+    ord[["UMAP.bray"]] <- calc_umap(dist.m = bray.dist)
+  }, error = function(e){cat("ERROR :",conditionMessage(e), "\n")})
+  }
+  # jsd distance
+  jsd.dist <- phyloseq::distance(phylo_obj, method = "jsd")
+  if (check_na(bray.dist)) {tryCatch({
+    ord[["MDS.jsd"]] <- phyloseq::ordinate(phylo_obj, method = "MDS", distance = jsd.dist)
+    ord[["NMDS.jsd"]] <- phyloseq::ordinate(phylo_obj, method = "NMDS", distance = jsd.dist)
+    ord[["tSNE.jsd"]] <- calc_tsne(dist.m = jsd.dist)
+    ord[["UMAP.jsd"]] <- calc_umap(dist.m = jsd.dist)
+  }, error = function(e){cat("ERROR :",conditionMessage(e), "\n")})
+  }
+  # gower distance
+  gower.dist <- phyloseq::distance(phylo_obj, method = "gower")
+  if (check_na(bray.dist)) {tryCatch({
+    ord[["MDS.gower"]] <- phyloseq::ordinate(phylo_obj, method = "MDS", distance = gower.dist)
+    ord[["NMDS.gower"]] <- phyloseq::ordinate(phylo_obj, method = "NMDS", distance = gower.dist)
+    ord[["tSNE.gower"]] <- calc_tsne(dist.m = gower.dist)
+    ord[["UMAP.gower"]] <- calc_umap(dist.m = gower.dist)
+  }, error = function(e){cat("ERROR :",conditionMessage(e), "\n")})
+  }
+  # dpcoa distance
+  # dpcoa.dist <- phyloseq::distance(phylo_obj, method = "dpcoa")
+  # if (check_na(bray.dist)) {tryCatch({
+  #   ord[["MDS.dpcoa"]] <- ordinate(phylo_obj, method = "MDS", distance = dpcoa.dist)
+  #   ord[["NMDS.dpcoa"]] <- ordinate(phylo_obj, method = "NMDS", distance = dpcoa.dist)
+  #   ord[["tSNE.dpcoa"]] <- calc_tsne(dist.m = dpcoa.dist)
+  #   ord[["UMAP.dpcoa"]] <- calc_umap(dist.m = dpcoa.dist)
+  # }, error = function(e){cat("ERROR :",conditionMessage(e), "\n")})
+  # }
+  # Calculate UniFracs (GUniFrac)
+  unifracs <- GUniFrac::GUniFrac(as.data.frame(t(phyloseq::otu_table(phylo_obj))),
+                                 phyloseq::phy_tree(phylo_obj),
+                                 alpha = c(0,0.5,1))$unifracs
+  # weighted UniFrac distance, alpha = 1
+  wuni.dist <- as.dist(unifracs[, , "d_1"])
+  if (check_na(wuni.dist)) {tryCatch({
+    ord[["MDS.wuni"]] <- phyloseq::ordinate(phylo_obj, method = "MDS", distance = wuni.dist)
+    ord[["NMDS.wuni"]] <- phyloseq::ordinate(phylo_obj, method = "NMDS", distance = wuni.dist)
+    ord[["tSNE.wuni"]] <- calc_tsne(dist.m = wuni.dist)
+    ord[["UMAP.wuni"]] <- calc_umap(dist.m = wuni.dist)
+  }, error = function(e){cat("ERROR :",conditionMessage(e), "\n")})
+  }
+  # GUniFrac with alpha 0
+  # previously running as Variance-adjusted-weighted UniFrac (vawuni) unifracs[, , "d_VAW"]
+  vawuni.dist <- as.dist(unifracs[, , "d_0"])
+  if (check_na(vawuni.dist)) {tryCatch({
+    ord[["MDS.vawuni"]] <- phyloseq::ordinate(phylo_obj, method = "MDS", distance = vawuni.dist)
+    ord[["NMDS.vawuni"]] <- phyloseq::ordinate(phylo_obj, method = "NMDS", distance = vawuni.dist)
+    ord[["tSNE.vawuni"]] <- calc_tsne(dist.m = vawuni.dist)
+    ord[["UMAP.vawuni"]] <- calc_umap(dist.m = vawuni.dist)
+  }, error = function(e){cat("ERROR :",conditionMessage(e), "\n")})
+  }
+  # generalized UniFrac distance (guni), alpha = 0.5
+  guni.dist <- as.dist(unifracs[, , "d_0.5"])
+  if (check_na(guni.dist)) {tryCatch({
+    ord[["MDS.guni"]] <- phyloseq::ordinate(phylo_obj, method = "MDS", distance = guni.dist)
+    ord[["NMDS.guni"]] <- phyloseq::ordinate(phylo_obj, method = "NMDS", distance = guni.dist)
+    ord[["tSNE.guni"]] <- calc_tsne(dist.m = guni.dist)
+    ord[["UMAP.guni"]] <- calc_umap(dist.m = guni.dist)
+  }, error = function(e){cat("ERROR :",conditionMessage(e), "\n")})
+  }
+  # # remove empty list slots
+  ord <- ord[lengths(ord) > 0]
+  return(ord)
+}
+
+# calculate ordinations for ZOTU/OTU counts
+ord_file_otus <- paste0(output_dir4,"/ordination_list_",
+                        ifelse(TU_type, "zotu", "otu"), ".rds")
+# if(file.exists(ord_file_otus)) {
+#   ord_otus <- readRDS(file = ord_file_otus)
+# } else {
+ord_otus <- base::lapply(trans_otus, calc_ordination)
+
+# calculate ordinations for genus counts
+ord_file_genus <- paste0(output_dir4,"/ordination_list_genus_",
+                        ifelse(TU_type, "zotu", "otu"), ".rds")
+# if(file.exists(ord_file_genus)) {
+#   ord_genus <- readRDS(file = ord_file_genus)
+# } else {  
+ord_genus <- base::lapply(trans_genus, calc_ordination)
+```
+
+## Export ordination results
+```{r export_ordination, echo = FALSE}
+incProgress(1/10, message = "Saving ordinations...")
+# save list of all ordination data to file
+#if(!file.exists(ord_file_otus)) {
+saveRDS(ord_otus, file = ord_file_otus)
+#}
+#if(!file.exists(ord_file_genus)) {
+saveRDS(ord_genus, file = ord_file_genus)
+#}
+```
+The ordination results were exported to the following files:
+
+\footnotesize
+* ``r ord_file_otus``
+* ``r ord_file_genus``
+
+\normalsize
+\newpage
+## Plotting
+Analyze ordination of differently normalized `r ifelse(TU_type, "ZOTU/ASV", "OTU")` and genus count data with MDS, NMDS and t-SNE algorithms. The plots need to be inspected for preservation of signal by transformation-, distance calculation- and ordination methods. Is there a biologically meaningful separation of groups in the ordination plots? For simplicity, the aspect ratio of all plots is set to 1. However, MDS/PCoA plots should be drawn using an aspect ratio corresponding to the different amount of data variability represented by the two axes.
+```{r plot_functions, echo = FALSE}
+incProgress(1/10, message = "Plotting dimensionality reduction techniques...")
+# source functions for plotting
+# source("../helper_functions/functions_plotting.R", local = knitr::knit_global())
+# function to loop through all ordinations
+plot_all_ord <- function(phylo_list, ord_list, group_param) {
+  pt <- stats::setNames(vector("list", length(ord_list)), names(ord_list))
+  for (i in names(ord_list)) {
+    pt[[i]] <- stats::setNames(vector("list", length(ord_list[[i]])), names(ord_list[[i]]))
+    for (j in names(ord_list[[i]])) {
+      analysis <- stringr::str_split(j, "\\.")[[1]]
+      plot_title <- paste(analysis[1], "based on", analysis[2])
+      if(analysis[1] == "tSNE") {
+        pt[[i]][[j]] <- plot_ord(phylo_list[[i]], ord_list[[i]][[j]],
+                                 group_param = group_param, title = plot_title,
+                                 type = "tSNE")
+      } else if(analysis[1] == "UMAP") {
+        pt[[i]][[j]] <- plot_ord(phylo_list[[i]], ord_list[[i]][[j]],
+                                 group_param = group_param, title = plot_title,
+                                 type = "UMAP")  
+      } else {
+        pt[[i]][[j]] <- plot_ord(phylo_list[[i]], ord_list[[i]][[j]],
+                                 group_param = group_param, title = plot_title,
+                                 type = "other")
+        }}}
+  return(pt)
+}
+
+# Plot ordinations for all ZOTU/OTU count transformation methods
+ord_plot_otus <- plot_all_ord(trans_otus, ord_otus, group_param = var_test)
+
+# Combine the plots of each count transformation method into one graphic and export.
+pt.list.otus <- list()
+for (i in names(ord_plot_otus)) {
+  pt.list.otus[[i]] <- patchwork::wrap_plots(ord_plot_otus[[i]]) +
+  patchwork::plot_layout(ncol = 4, guides = 'collect') & ggplot2::theme(legend.position = 'bottom')
+  # pt.otus <- egg::ggarrange(plots = ord_plot_otus[[i]], ncol = 4)
+}
+# Plot ordinations for all genus count transformation methods
+ord_plot_genus <- plot_all_ord(trans_genus, ord_genus, group_param = var_test)
+# Combine the plots of each count transformation method into one graphic and export.
+pt.list.genus <- list()
+for (i in names(ord_plot_genus)) {
+  pt.list.genus[[i]] <- patchwork::wrap_plots(ord_plot_genus[[i]]) +
+  patchwork::plot_layout(ncol = 4, guides = 'collect') & ggplot2::theme(legend.position = 'bottom')
+  # pt.genus <- egg::ggarrange(plots = ord_plot_genus[[i]], ncol = 4)
+}
+
+```
+```{r captions, echo = FALSE}
+# Prepare figure captions
+fig_caps <- paste("Ordination of", c("original", "relative-transformed",
+                                     "log-transformed", "Hellinger-transformed",
+                                     "RLE-transformed", #"vst-transformed",
+                                     "CLR-transformed", "alternative CLR-transformed"))
+otus_caps <- paste(fig_caps, ifelse(TU_type, "ZOTU/ASV", "OTU"), "count data.")
+genus_caps <- paste(fig_caps, "genus count data.")
+```
+\newpage
+### Plot graphs for **`r ifelse(TU_type, "ZOTU/ASV", "OTU")`** counts
+```{r plot_otus, echo = FALSE, results = 'hide', fig.cap = otus_caps}
+pt.list.otus
+# Plot ordinations for all OTU count transformation methods
+# ord_plot_otus <- plot_all_ord(trans_otus, ord_otus, group_param = var_test)
+# 
+# # Combine the plots of each count transformation method into one graphic and export.
+# for (i in names(ord_plot_otus)) {
+#   pt.otus <- patchwork::wrap_plots(ord_plot_otus[[i]]) +
+#   plot_layout(ncol = 4, guides = 'collect') & theme(legend.position = 'bottom')
+#   pt.otus
+#   # pt.otus <- egg::ggarrange(plots = ord_plot_otus[[i]], ncol = 4)
+# }
+```
+\newpage
+### Plot graphs for **genus** counts 
+```{r plot_genus, echo = FALSE, results = 'hide', fig.cap = genus_caps}
+pt.list.genus
+# Plot ordinations for all genus count transformation methods
+# ord_plot_genus <- plot_all_ord(trans_genus, ord_genus, group_param = var_test)
+# 
+# # Combine the plots of each count transformation method into one graphic and export.
+# for (i in names(ord_plot_genus)) {
+#   pt.genus <- patchwork::wrap_plots(ord_plot_genus[[i]]) +
+#   plot_layout(ncol = 4, guides = 'collect') & theme(legend.position = 'bottom')
+#   pt.genus
+#   # pt.genus <- egg::ggarrange(plots = ord_plot_genus[[i]], ncol = 4)
+# }
+```
+\newpage
+## Record session information
+\tiny
+```{r session_info, echo = FALSE}
+incProgress(1/10, message = "Saving...")
+sessionInfo()
+```

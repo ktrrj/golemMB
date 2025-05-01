@@ -1,0 +1,954 @@
+---
+title: "Import data to phyloseq object"
+author: "Dr. Roman Gerlach"
+date: "`r format(Sys.time(), '%d.%m.%y')`"
+header-includes:
+- \usepackage{float} #use the 'float' package
+- \floatplacement{figure}{H} #make every figure with caption = h
+- \usepackage{flafter}
+- \usepackage{booktabs}
+- \usepackage{longtable}
+- \usepackage{array}
+- \usepackage{multirow}
+- \usepackage{wrapfig}
+- \usepackage{colortbl}
+- \usepackage{pdflscape}
+- \usepackage{tabu}
+- \usepackage{threeparttable}
+- \usepackage{threeparttablex}
+- \usepackage[normalem]{ulem}
+- \usepackage{makecell}
+- \usepackage{xcolor}
+output:
+  pdf_document:
+    latex_engine: lualatex
+    fig_width: 7
+    fig_height: 6
+    fig_caption: TRUE
+    df_print: kable
+    extra_dependencies: ["float"]
+    includes:
+      in_header: header.tex
+  word_document: default
+  html_document:
+    df_print: kable
+    theme: cerulean
+    highlight: haddock
+    toc: yes
+    toc_depth: 3
+    toc_float: TRUE
+    collapsed: FALSE
+    smooth_scroll: TRUE
+    code_fold: show
+params:
+  author:
+    label: "author of the analysis"
+    value: "no author given"
+  workdir:
+    label: "working directory"
+    value: "U:/00_Shiny/Test"
+  TU_type:
+    label: "type of taxonomic units analyzed"
+    value: "OTU"
+  TU_file:
+    label: "path to TU table"
+    value: NULL
+  TU_tree_file:
+    label: "path to TU seq tree file"
+    value: NULL
+  TU_fasta_file:
+    label: "path to TU seq file (fasta)"
+    value: NULL
+  species_assign:
+    label: "do DADA2-based species assignment"
+    value: FALSE
+    choices: [TRUE, FALSE]
+  meta_file:
+    label: "path to metadata file (rds format)"
+    value: NULL
+  filter_var:
+    label: "variable used for filtering"
+    value: "sampleID"
+  samples_excluded:
+    label: "vector of samples excluded from analysis"
+    value: !r c()
+  samples_outlier:
+    label: "vector of samples identified as outliers"
+    value: !r c()
+  min_sample_counts:
+    label: "minimum read count for samples"
+    value: 10000
+  min_tu_counts:
+    label: "minimum total counts for taxonomic units (TUs)"
+    value: 1 
+  var_test:
+    label: "metadata variable used for plotting"
+    value: NULL
+  var_name:
+    label: "variable name for plotting"
+    value: NULL
+  point_label:
+    label: "metadata variable used for labeling points"
+    value: "sample_ID"
+  shape_var:
+    label: "optional variable to use for point shape"
+    value: NULL
+  count_transform:
+    label: "count transformation before ordination"
+    value: log10p
+    choices: [compositional, Z, log10, log10p, hellinger, identity, clr, alr]
+  color_set:
+    label: "define colors, optionally as named vector"
+    value: !r NULL
+  label_set:
+    label: "named vector for plot labels"
+    value: !r NULL
+fontsize: 10pt
+urlcolor: blue
+papersize: a4
+editor_options: 
+  chunk_output_type: console
+---
+```{r version, echo = FALSE}
+script_version <- "1.10"
+#script_date <- file.info("C:\\MyFolder\\test.csv")$mtime
+```
+This is 'Import data to phyloseq object' script version **`r script_version`** by Dr. Roman Gerlach.
+```{r global_options, echo = FALSE}
+# Set up global options for nice reports and keeping figures:
+knitr::opts_chunk$set(fig.width = 7, fig.align = "center", out.extra = "",
+                      warning = FALSE, message = FALSE, fig.pos = "!H",
+                      dev = "cairo_pdf",
+                      cache.path = params$workdir)
+options(knitr.kable.NA = '')
+```
+**Load required libraries**
+```{r libraries, warning = FALSE, message = FALSE}
+setProgress(1/8, message = "Loading required libraries...")
+library(tidyverse)
+library(ggtext)
+library(phyloseq)
+library(phangorn)
+library(decontam)
+library(dada2)
+library(Biostrings)
+library(vegan)
+library(patchwork)
+library(Polychrome)
+library(RColorBrewer)
+library(egg)
+library(rmarkdown)
+library(knitr)
+library(kableExtra)
+library(biomeUtils)
+library(Biostrings)
+library(biomformat)
+```
+```{r filepaths, echo = FALSE}
+TU_type <- ifelse(params$TU_type == "OTU", FALSE, TRUE)
+TU_file <- gsub("\\\\", "/", file.path(params$TU_file))
+TU_tree_file <- gsub("\\\\", "/", file.path(params$TU_tree_file))
+TU_fasta_file <- gsub("\\\\", "/", file.path(params$TU_fasta_file))
+meta_file <- gsub("\\\\", "/", file.path(params$meta_file))
+species_assign <- params$species_assign
+# source accessory functions, e.g. for working with phyloseq objects
+# source("../helper_functions/functions_accessory.R", local = knitr::knit_global())
+set.seed(42)
+```
+
+# 1. Setting up environment and script parameters
+Type of imported taxonomic units (TUs)
+`r ifelse(TU_type == "OTU", paste0("Taxonomic data is present in the form of **OTUs** (Operational Taxonomic Units)"), paste0("Taxonomic data is present in the form of **ZOTUs/ASVs** (Zero-radius Operational Taxonomic Units/Amplicon Sequence Variants)"))`
+
+Define paths to files with TU and meta data:
+
+* TU_file: **`r pander::pander(TU_file)`**
+* TU_tree_file: **`r pander::pander(TU_tree_file)`**
+* TU_fasta_file: **`r pander::pander(TU_fasta_file)`**
+* meta_file: **`r pander::pander(meta_file)`**
+
+```{r filtering_parameters, echo = FALSE}
+# metadata variable used for filtering
+filter_var <- params$filter_var
+# pattern (regex) or names of excluded samples
+samples_excluded <- params$samples_excluded
+# pattern (regex) or names of outlier samples
+samples_outlier <- params$samples_outlier
+# minimum total counts/sample
+min_sample_counts <- params$min_sample_counts
+# minimum total counts for taxonomic units (TUs)
+min_tu_counts <- params$min_tu_counts
+```
+Define parameters for filtering the data set:
+
+* filter_var         = **`r pander::pander(filter_var)`**
+* samples_excluded   = **`r ifelse(length(samples_excluded > 0), pander::pander(samples_excluded), "none")`** (RegEx applied to variable: `r filter_var`)
+* samples_outlier    = **`r ifelse(length(samples_outlier > 0), pander::pander(samples_outlier), "none")`** (must be valid sample name(s))
+* min_sample_counts  = **`r pander::pander(min_sample_counts)`**
+* min_tu_counts  = **`r pander::pander(min_tu_counts)`**
+
+```{r NMDS_plot_parameters, echo = FALSE}
+var_test <- params$var_test
+var_name <- params$var_name
+point_label <- params$point_label
+shape_var <- params$shape_var
+color_set <- params$color_set 
+label_set <- params$label_set
+count_transform <- params$count_transform
+```
+Set variables for ordination plot:
+
+* count transformation method = **`r pander::pander(count_transform)`**
+* var_test    = **`r pander::pander(var_test)`**
+* var_name    = **`r pander::pander(var_name)`**
+* point_label = `r ifelse(!is.null(point_label), paste0("**", pander::pander(point_label), "**"), "**none**")`
+* shape_var   = `r ifelse(!is.null(shape_var), paste0("**", pander::pander(shape_var), "**"), "**none**")`
+
+color_set:
+`r show_color_set(color_set)`
+
+label_set:
+`r show_label_set(label_set)`
+
+```{r debugging, eval=FALSE, echo=FALSE}
+# source("/rmd/functions_accessory.R")
+TU_file <- file.path(workdir, ZOTU_file)
+TU_tree_file <- file.path(workdir, ZOTU_tree_file)
+TU_fasta_file <- file.path(workdir, ZOTU_fasta_file)
+meta_file <- file.path(workdir, meta_file)
+species_assign <- FALSE
+set.seed(42)
+TU_type <- "ZOTU"
+TU_type <- ifelse(TU_type == "OTU", FALSE, TRUE)
+min_tu_counts <- 1
+
+# metadata variable used for filtering
+# filter_var <- params$filter_var
+# pattern (regex) or names of excluded samples
+# samples_excluded <- params$samples_excluded
+# pattern (regex) or names of outlier samples
+# samples_outlier <- params$samples_outlier
+# minimum total counts/sample
+# min_sample_counts <- params$min_sample_counts
+
+# var_test <- params$var_test
+# var_name <- params$var_name
+# point_label <- params$point_label
+# shape_var <- params$shape_var
+# color_set <- params$color_set 
+# label_set <- params$label_set
+```
+
+# 2. Data import
+
+## 2.1 Import TU table in BIOM (tsv) format, exported from USEARCH/QIIME2
+```{r import_TU_data}
+incProgress(1/8, message = "Importing TU table and fastas...")
+Sys.sleep(2)
+
+# define taxonomy column names
+tax_columns <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+
+# import TU tabe
+TU_table <- read_tsv(TU_file, col_types = cols())  %>%
+  tidyr::separate(col = taxonomy, into = tax_columns, sep = ";", fill = "right")
+
+# rename first df column
+names(TU_table)[1] <- "TU"
+
+# separate TU counts from taxonomy
+TU <- TU_table %>%
+  dplyr::select(all_of(colnames(TU_table)[!colnames(TU_table) %in% tax_columns])) %>%
+  column_to_rownames("TU")
+# order data
+TU <- TU[order(row.names(TU)),] 
+
+# extract taxonomy information
+tax <- dplyr::select(TU_table, TU, all_of(tax_columns)) %>%
+  mutate(across(everything(), \(x) na_if(x, ""))) %>%
+  column_to_rownames("TU")
+
+# import TU sequences from fasta
+ref_seqs <- readDNAStringSet(file = TU_fasta_file,
+  format = "fasta", nrec = -1L, skip = 0L, seek.first.rec = FALSE, use.names = TRUE)
+```
+## 2.2 Assign species names to TU sequences
+`r ifelse(species_assign, paste("Species assignment is done using the DADA2 function assignSpecies() with SILVA v138.1 and NCBI 16S rDNA sequence databases:"), ifelse(all(is.na(tax$Species)), paste("No species assignment done."), paste("Species assignment was done before using DADA2 and NCBI BLAST.")))`
+```{r species_assign, eval = species_assign, echo = species_assign}
+incProgress(1/8, message = "Assigning species names to TU sequences...")
+
+# transform sequences in character vector format
+seqs <- getSequences(ref_seqs)
+
+# define paths for reference databases
+dbpath = "U:/00_Shiny/Test/Species_assignment/"
+ref_silva = paste0(dbpath, "silva_species_assignment_v138.1.fa.gz")
+ref_ncbi = paste0(dbpath, "16SMicrobial.fa.gz")
+
+# assign species using SILVA and NCBI databases
+spec_silva = dada2::assignSpecies(seqs, ref_silva, allowMultiple = FALSE, tryRC = TRUE)
+spec_ncbi = dada2::assignSpecies(seqs, ref_ncbi, allowMultiple = FALSE, tryRC = TRUE)
+
+# Combine species-level taxonomic assignment from 2 reference sources
+s_final <- as.data.frame(spec_ncbi, stringsAsFactors = FALSE) %>%
+  mutate(Genus = str_replace_all(Genus, "\\[|\\]", ""),
+         TU = names(seqs)) %>%
+  left_join(
+    as.data.frame(spec_silva, stringsAsFactors = FALSE) %>%
+      mutate(TU = names(seqs)), by = "TU") %>%
+  mutate(
+    Genus = coalesce(Genus.y, Genus.x),
+    Species = coalesce(Species.y, Species.x)) %>%
+  select(TU, Genus, Species)
+
+# modify taxonomy df with species assignments
+tax <- tax %>%
+  rownames_to_column(var = "TU") %>%
+  left_join(s_final, by = "TU") %>%
+  mutate(
+    Genus = coalesce(Genus.x, Genus.y),
+    Genus = str_replace_all(Genus, "\\[|\\]", ""),
+    Species = coalesce(Species.y, Species.x)) %>%
+  select(TU, Kingdom:Family, Genus, Species) %>%
+  column_to_rownames(var = "TU")
+```
+`r ifelse(species_assign, paste0("Using the combined SILVA and NCBI 16S rDNA databases **", sum(!is.na(s_final[,2])), "** TUs out of **", nrow(s_final), "** TUs were assigned to the species level."), ifelse(all(is.na(tax$Species)), "", paste0("In the TU table **", sum(!is.na(tax$Species)), "** TUs out of **", nrow(tax), "** TUs were assigned to the species level.")))`
+
+## 2.3 Import metadata from RDS file
+```{r import_meta}
+incProgress(1/8, message = "Importing metadata...")
+Sys.sleep(2)
+# import metadata
+meta <- readRDS(meta_file)
+
+# check for sample presence in meta data 
+notinmeta <- colnames(TU)[!(colnames(TU) %in% row.names(meta))]
+if(length(notinmeta) > 0) {notinmeta <- notinmeta[order(notinmeta)]}
+
+# filter meta df according to samples present in TU table
+meta <- meta[row.names(meta) %in% colnames(TU), ]
+
+# add row names as sample_ID column to metadata
+meta <- mutate(meta, sample_ID = row.names(meta))
+```
+The following samples are present in the TU table but not in the meta data:<br> `r if(length(notinmeta) == 0) {"**none**"}`<br>
+```{r not_in_meta, eval = length(notinmeta) != 0, echo = FALSE, out.extra = ''}
+# generate df of samples not present in meta data
+if(length(notinmeta) == 1) { 
+notinmeta_df <- data.frame(Reads = sum(TU[, notinmeta]))
+row.names(notinmeta_df) <- notinmeta } else {
+  notinmeta_df <- data.frame(Reads = colSums(TU[, notinmeta])) %>%
+  rownames_to_column(var = "Sample") %>%
+  arrange(Reads)
+}
+
+# display df using kable
+kbl(head(notinmeta_df, 10),
+    caption = paste("There", ifelse(length(notinmeta) == 1, "was", "were"),
+                    length(notinmeta), ifelse(length(notinmeta) == 1, "sample", "samples"),
+                    "NOT present in the meta data and therefore EXCLUDED from further analyses.",
+                    if(length(notinmeta) > 10) {"The 10 samples with lowest read count are shown:"}),
+    booktabs = TRUE, linesep = "", format.args = list(big.mark = ",")) %>%
+kable_styling(latex_options = c("striped", "HOLD_position"))
+```
+\newpage
+## 2.4 Construct phyloseq object
+```{r phyloseq_construct}
+incProgress(1/8, message = "Constructing phyloseq object...")
+Sys.sleep(1)
+
+TU.UF <- otu_table(as.matrix(TU), taxa_are_rows = TRUE)
+tax.UF <- tax_table(as.matrix(tax))
+meta.UF <- sample_data(meta)
+tree <- read.tree(TU_tree_file)
+# root tree at midpoint if unrooted (e.g. SILVA output)
+if (!is.rooted(tree)) {tree <- midpoint(tree)}
+physeq <- phyloseq(TU.UF, tax.UF, meta.UF, tree, ref_seqs)
+# remove TUs with less than 'min_tu_counts'
+physeq <- prune_taxa(taxa_sums(physeq) >= min_tu_counts, physeq)
+physeq
+```
+```{r remove_ori_ctrls}
+# remove CTRL samples
+physeq.0 <- subset_samples(physeq, samp_ctrl == "sample")
+# remove taxa with less than 'min_tu_counts' after filtering
+physeq.0 <- prune_taxa(taxa_sums(physeq.0) >= min_tu_counts, physeq.0)
+physeq.0
+```
+# 3. Filter **samples**
+
+## 3.1 Remove all samples excluded from study
+
+Filter excluded samples (see above) and optionally filter based on metadata:
+```{r filter_excluded}
+incProgress(2/8, message = "Filtering samples...")
+# remove excluded samples but retain negative controls
+if (length(samples_excluded) != 0) {
+physeq.1 <- prune_samples(str_detect(
+  pull(dplyr::select(data.frame(sample_data(physeq)), all_of(filter_var))),
+  pattern = paste(samples_excluded, collapse = "|"), negate = TRUE) | str_detect(
+  pull(dplyr::select(data.frame(sample_data(physeq)), all_of("samp_ctrl"))),
+  pattern = paste("neg_ctrl", collapse = "|")), physeq)
+# remove taxa with less than 'min_tu_counts' after filtering
+physeq.1 <- prune_taxa(taxa_sums(physeq.1) >= min_tu_counts, physeq.1)
+
+} else {physeq.1 <- physeq}
+pruned_samples <- sample_names(physeq)[!(sample_names(physeq) %in% sample_names(physeq.1))]
+pruned_samples <- pruned_samples[order(pruned_samples)]
+```
+
+The following samples were excluded from the further analyses: <br>`r if(length(pruned_samples) == 0) {"**none**"}`<br>
+```{r pruned_samples, eval = length(pruned_samples) != 0, echo = FALSE, out.extra = ''}
+# generate df of samples excluded from study
+if(length(pruned_samples) == 1) { 
+pruned_samples_df <- data.frame(Reads = sum(TU[, pruned_samples]))
+row.names(pruned_samples_df) <- pruned_samples } else {
+  pruned_samples_df <- data.frame(Reads = colSums(TU[, pruned_samples])) %>%
+  rownames_to_column(var = "Sample") %>%
+  arrange(desc(Reads))
+}
+
+# display df using kable
+kbl(head(pruned_samples_df, 10),
+    caption = paste("There", ifelse(length(pruned_samples) == 1, "was", "were"),
+                    length(pruned_samples), ifelse(length(pruned_samples) == 1, "sample", "samples"), "excluded from further analyses.",
+                    if(length(pruned_samples) > 10) {"The 10 samples with highest read count are shown:"}),
+    booktabs = TRUE, linesep = "", format.args = list(big.mark = ",")) %>%
+kable_styling(latex_options = c("striped", "HOLD_position"))
+```
+
+\newpage
+## 3.2 Remove low performing samples
+Read coverage of samples (no negative controls)
+```{r hist_rare, echo = FALSE, fig.height = 7, fig.cap = "Histogram (A) and rarefaction curves (B) of all samples. The red dashed line denotes the minimum read filtering threshold."}
+# remove all negative controls
+physeq.1a <- subset_samples(physeq.1, samp_ctrl == "sample")
+# remove taxa with less than 'min_tu_counts' after filtering
+physeq.1a <- prune_taxa(taxa_sums(physeq.1a) >= min_tu_counts, physeq.1a)
+# estimate plotting range
+max_counts <- quantile(colSums(otu_table(physeq.1a)), probs = 0.95)
+# plot histogram of read distribution
+hist.pt <- ggplot(tibble(counts = colSums(otu_table(physeq.1a))), aes(x = counts)) +
+  geom_histogram(bins = 100) +
+  theme_light() +
+  coord_cartesian(xlim = c(0, max_counts)) +
+  geom_vline(xintercept = min_sample_counts, color = "red", linetype = 'dashed') + 
+  xlab("Number of Reads") + ylab('Number of Samples')
+
+# Calculate rarefaction data with vegan
+rarefactionCurve <- vegan::rarecurve(data.frame(t(otu_table(physeq.1a))),
+                              step = 20,
+                              tidy = TRUE)
+# plot the rarefaction data
+rare.pt <- ggplot(rarefactionCurve, aes(x = Sample, y = Species, group = Site)) +
+  theme_light() + 
+  scale_color_discrete(guide = "none") +  # turn legend on or off
+  coord_cartesian(xlim = c(0, max_counts)) +
+  geom_line(alpha = 0.3) +
+  geom_vline(xintercept = min_sample_counts, color = "red", linetype = 'dashed') + 
+  xlab("Number of Reads") + ylab('Number of TUs')
+
+# arrange plots
+egg::ggarrange(hist.pt, rare.pt, ncol = 1, labels = c("A", "B"),
+               label.args = list(gp = grid::gpar(cex = 1.5, face = "bold")))
+
+```
+Remove samples with total TU counts below threshold.
+```{r filter_counts}
+# filter samples based on count threshold but without removing negative controls
+# there is a bug in subset_samples that prevents the use of the following syntax
+# in combination with purrr or job (access to sample_sums within subset_samples)
+# physeq.2 <- subset_samples(physeq.1,
+# (samp_ctrl == "neg_ctrl") | (sample_sums(physeq.1) >= min_sample_counts))
+# alternative way to filter samples using prune_samples:
+physeq.2 <- prune_samples(
+  sample_sums(physeq.1) >= min_sample_counts |
+  sample_data(physeq.1)$samp_ctrl == "neg_ctrl",
+  physeq.1)
+# remove taxa with less than 'min_tu_counts' after sample filtering
+physeq.2 <- prune_taxa(taxa_sums(physeq.2) >= min_tu_counts, physeq.2)
+
+pruned_samples2 <- sample_names(physeq.1)[!(sample_names(physeq.1) %in% sample_names(physeq.2))]
+```
+There were `r ifelse(length(pruned_samples2) > 0, paste0("**", length(pruned_samples2), "**"), "**no**")` samples with reads below the minimum read threshold of **`r as.integer(min_sample_counts)`**.<br>
+```{r pruned_samples2, eval = length(pruned_samples2) != 0, echo = FALSE, out.extra = ''}
+pruned_samples2 <- pruned_samples2[order(pruned_samples2)]
+# generate df of samples below read threshold
+if(length(pruned_samples2) == 1) { 
+pruned_samples2_df <- data.frame(Reads = sum(TU[, pruned_samples2]))
+row.names(pruned_samples2_df) <- pruned_samples2 } else {
+  pruned_samples2_df <- data.frame(Reads = colSums(TU[, pruned_samples2])) %>%
+  rownames_to_column(var = "Sample") %>%
+  arrange(Reads)
+}
+
+# display df using kable
+kbl(head(pruned_samples2_df, 10),
+    caption = paste("There", ifelse(length(pruned_samples2) == 1, "was", "were"),
+                    length(pruned_samples2), ifelse(length(pruned_samples2) == 1, "sample", "samples"), "below the read threshold.",
+                    if(length(pruned_samples2) > 10) {"The 10 samples with lowest read count are shown:"}),
+    booktabs = TRUE, linesep = "", format.args = list(big.mark = ",")) %>%
+kable_styling(latex_options = c("striped", "HOLD_position"))
+```
+\newpage
+## 3.3 Remove outliers based on ordination
+Identify outlier samples in Principal Coordinate Analysis (PCoA) / Multidimensional Scaling (MDS) ordination, based on Bray-Curtis dissimilarity of
+`r count_transform`-transformed count data:
+```{r ordination_function, echo = FALSE, results = 'hide'}
+# the perform NMDS using bray's distances
+plot_ord <- function(ps, ord.method) {
+  # transformation of counts
+  ps <- microbiome::transform(ps, transform = count_transform)
+  # ps <- transform_sample_counts(ps, function(x) log(1 + x) )
+  out.pcoa.ps <- ordinate(ps, method = ord.method, distance = "bray")
+  evals <- if(is.null(out.pcoa.ps$values$Eigenvalues)) {c(1,1)} else {
+    out.pcoa.ps$values$Eigenvalues[c(1,2)]}
+  pt <- phyloseq::plot_ordination(ps, out.pcoa.ps, type = "samples", color = var_test,
+                                  label = point_label, shape = shape_var) +
+    labs(col = var_name, shape = shape_var) +
+    guides(
+      shape = guide_legend(
+        title.position = "top"),
+      color = guide_legend(
+        title.position = "top",
+        override.aes = aes(label = ""))) +
+    scale_color_manual(values = color_set, name = var_name, labels = label_set,
+                       aesthetics = c("colour", "fill")) +
+    scale_x_continuous(expand = expansion(mult = 0.1)) +
+    scale_y_continuous(expand = expansion(mult = 0.1)) +
+    coord_fixed(sqrt(evals[2] / evals[1])) +
+    egg::theme_article() +
+    theme(legend.position = "bottom",
+          legend.text = element_markdown(margin = margin(l = 0, unit = "pt")))
+return(pt)
+}
+```
+```{r ordination, eval = length(samples_outlier) == 0, echo = FALSE, results = 'hide', fig.height = 4, fig.cap = "MDS ordination of all samples"}
+physeq.3 <- physeq.2
+# remove negative controls before plotting
+plot_ord(subset_samples(physeq.2, samp_ctrl == "sample"), "MDS")
+```
+The following samples were identified as outliers and therefore excluded from the further analyses:<br> `r if(length(samples_outlier) == 0) {"**none**"}`<br>
+```{r outliers, eval = length(samples_outlier) != 0, echo = FALSE, out.extra = ''}
+# generate df of samples identified as outliers
+if(length(samples_outlier) == 1) { 
+samples_outlier_df <- data.frame(Reads = sum(TU[, samples_outlier]))
+row.names(samples_outlier_df) <- samples_outlier } else {
+  samples_outlier_df <- data.frame(Reads = colSums(TU[, samples_outlier])) %>%
+  rownames_to_column(var = "Sample") %>%
+  arrange(Reads)
+}
+
+# display df using kable
+kbl(head(samples_outlier_df, 10),
+    caption = paste("There", ifelse(length(samples_outlier) == 1, "was", "were"),
+                    length(samples_outlier), ifelse(length(samples_outlier) == 1, "sample identified as outlier.", "samples identified as outliers."),
+                    if(length(samples_outlier) > 10) {"The 10 samples with lowest read count are shown:"}),
+    booktabs = TRUE, linesep = "", format.args = list(big.mark = ",")) %>%
+kable_styling(latex_options = c("striped", "HOLD_position"))
+```
+```{r ordination2, eval = length(samples_outlier) != 0, echo = FALSE, results = 'hide', fig.height = 7, fig.cap = "Ordination of all samples before (A) and after (B) outlier removal", out.extra = ''}
+# remove outlier sample(s) from physeq object
+physeq.3 <- prune_samples(str_detect(
+  sample_names(physeq.2), pattern = paste(paste0("\\b", samples_outlier, "\\b"), collapse = "|"),
+                                     negate = TRUE), physeq.2)
+# remove taxa with less than 'min_tu_counts' after sample filtering
+physeq.3 <- prune_taxa(taxa_sums(physeq.3) >= min_tu_counts, physeq.3)
+
+# arrange plots
+# remove negative controls before plotting
+egg::ggarrange(plot_ord(subset_samples(physeq.2, samp_ctrl == "sample"), "MDS") + theme(legend.position = "none"),
+               plot_ord(subset_samples(physeq.3, samp_ctrl == "sample"), "MDS"),
+               ncol = 1, labels = c("A", "B"),
+               label.args = list(gp = grid::gpar(cex = 1.5, face = "bold")))
+```
+```{r remove_sample_filt_ctrls}
+# remove CTRL samples after sample filtering
+physeq.3a <- subset_samples(physeq.3, samp_ctrl == "sample")
+# remove taxa with less than 'min_tu_counts' after filtering
+physeq.3a <- prune_taxa(taxa_sums(physeq.3a) >= min_tu_counts, physeq.3a)
+```
+
+\newpage
+# 4. Filter **taxonomic units**
+
+`r if(TU_type) {"## 4.1 Identify and remove contaminant TUs\nContaminants are identified with the help of negative controls using the ['decontam' package](https://benjjneb.github.io/decontam/vignettes/decontam_intro.html#necessary-ingredients). True samples and negative controls need to be categorized in the metadata column 'samp_ctrl'. The negative control samples should have fewer reads compared to the true samples (if using comparable library prep protocols):\n"}` 
+```{r read_compare, eval = TU_type, echo = FALSE, fig.height = 3, fig.cap = "Read distribution of samples and negative controls (neg\\_ctrl)."}
+plot_read_distribution <- function(ps) {
+  df <- as.data.frame(sample_data(ps))
+  df$LibrarySize <- sample_sums(ps)
+  df <- df[order(df$LibrarySize),]
+  df$Index <- seq(nrow(df))
+  ggplot(data = df, aes(x = Index, y = LibrarySize, color = samp_ctrl)) +
+    geom_point() +
+    theme_article()
+}
+# plot the read distribution
+plot_read_distribution(physeq.3)
+incProgress(1/8)
+Sys.sleep(1)
+
+```
+`r if(TU_type) {"### 4.1.1 Frequency-based contaminant identification\nReal contaminants should fit the model for which frequency is expected to be inversely proportional to input DNA concentration. Here, a value for DNA concentration (e.g. Qubit measurements of the final libraries or qPCR data) must be provided in the metadata column 'quant_reading'.\n"}` 
+```{r decontam_freq, eval = TU_type, echo = TU_type}
+# frequency-based contaminant identification 
+require(dplyr)
+contamdf.freq <- isContaminant(physeq.3, method = "frequency", conc = "quant_reading")
+print(contamdf.freq)
+# prune contaminant TUs
+physeq.4 <- prune_taxa(!(contamdf.freq$contaminant), physeq.3)
+```
+```{r decontam_freq_table, eval = TU_type, echo = FALSE}
+# filter contaminants
+contamdf.freq.pos <- dplyr::filter(contamdf.freq, contaminant == TRUE) %>%
+  dplyr::select(Prevalence = prev, Frequency = freq, p_value = p) %>%
+  arrange(p_value)
+
+# display df using kable
+kbl(head(contamdf.freq.pos, 10),
+    caption = paste("Based on frequency in relation to DNA concentration", nrow(contamdf.freq.pos),
+                    ifelse(nrow(contamdf.freq.pos) == 1, "TU was identified as contaminant.", "TUs were identified as contaminants."),
+                    if(nrow(contamdf.freq.pos) > 10) {"The 10 TUs with lowest p-value are shown."}),
+    booktabs = TRUE, linesep = "", format.args = list(big.mark = ",")) %>%
+kable_styling(latex_options = c("striped", "HOLD_position"))
+```
+```{r decontam_freq_plot, eval = TU_type, echo = FALSE, fig.cap = "Plot of frequency vs. DNA concentration (red line) of contaminant TUs."}
+plot_frequency(physeq.3, row.names(head(contamdf.freq.pos, 10)), conc = "quant_reading") +
+  xlab("DNA Concentration (Qubit ng/µL)") + theme_article()
+```
+`r if(TU_type) {"### 4.1.2 Prevalence-based contaminant identification\n"}` 
+```{r decontam_prev, eval = TU_type, echo = TU_type}
+# update metadata to mark negative controls
+physeq.5 <- physeq.4
+sample_data(physeq.5)$is.neg <- sample_data(physeq.5)$samp_ctrl == "neg_ctrl"
+
+# prevalence-based contaminant identification 
+contamdf.prev <- isContaminant(physeq.5, method = "prevalence", neg = "is.neg")
+```
+```{r decontam_prev_table, eval = TU_type, echo = FALSE}
+# filter contaminants
+contamdf.prev.pos <- dplyr::filter(contamdf.prev, contaminant == TRUE) %>%
+  dplyr::select(Prevalence = prev, Frequency = freq, p_value = p) %>%
+  arrange(p_value)
+
+# display df using kable
+kbl(head(contamdf.prev.pos, 10),
+    caption = paste("Based on prevalence", nrow(contamdf.prev.pos),
+                    ifelse(nrow(contamdf.prev.pos) == 1, "TU was identified as contaminant.", "TUs were identified as contaminants."),
+                    if(nrow(contamdf.prev.pos) > 10) {"The 10 TUs with lowest p-value are shown."}),
+    booktabs = TRUE, linesep = "", format.args = list(big.mark = ",")) %>%
+kable_styling(latex_options = c("striped", "HOLD_position"))
+```
+```{r decontam_prev_plot, eval = TU_type, echo = TU_type, fig.height = 3.5,  echo = FALSE, fig.cap = "Plot of relative TU prevalences in negative controls vs. true samples."}
+plot_prev_distribution <- function(ps) {
+  # ps.pa <- transform_sample_counts(ps, function(abund) 1*(abund>0))
+  ps.pa <- microbiome::transform(ps, transform = "compositional") #"Z"
+  ps.pa.neg <- prune_samples(sample_data(ps.pa)$samp_ctrl == "neg_ctrl", ps.pa)
+  ps.pa.pos <- prune_samples(sample_data(ps.pa)$samp_ctrl == "sample", ps.pa)
+  df.pa <- data.frame(pa.pos=taxa_sums(ps.pa.pos), pa.neg=taxa_sums(ps.pa.neg),
+                      contaminant=contamdf.prev$contaminant)
+  ggplot(data = df.pa, aes(x = pa.neg, y = pa.pos, color = contaminant)) +
+    geom_point() +
+    xlab("Relative prevalence (negative controls)") +
+    ylab("Relative prevalence (true samples)") +
+    theme_article()
+}
+# plot the prevalence distribution
+plot_prev_distribution(physeq.5)
+```
+```{r prune_prevalence, eval = TU_type, echo = TU_type}
+# prune contaminant TUs
+physeq.5 <- prune_taxa(!(contamdf.prev$contaminant), physeq.5)
+```
+`r if(TU_type) {"## 4.2 Remove negative controls from data set\n"} else {"## 4.1 Remove negative controls from data set\n"}`
+After removing (negative) control samples from the data set subsequently remove TUs which now has zero prevalence.
+```{r remove_ctrls}
+# remove CTRL samples
+physeq.6 <- subset_samples(if(TU_type) physeq.5 else physeq.3, samp_ctrl == "sample")
+# remove taxa with less than 'min_tu_counts' after filtering
+physeq.6 <- prune_taxa(taxa_sums(physeq.6) >= min_tu_counts, physeq.6)
+physeq.6
+```
+`r if(TU_type) {"## 4.3 Remove ambiguous and eukaryotic sequences\n"} else {"## 4.2 Remove ambiguous and eukaryotic sequences\n"}`
+A filter is applied to remove TUs without or with ambiguous (Kingdom/Phylum-level) taxonomy or assigned to eukaryotic sequences, mostly belonging to mitochondria or chloroplasts. Ideally, these entries should be corrected by adding taxonomic information to the TU table, e.g. by using BLAST against the NCBI 'nr' database. 
+```{r filter_ambig_euk}
+# filter TUs with ambiguous tax or eukaryoutic sequences
+physeq.7 <- subset_taxa(
+  physeq.6,
+    Kingdom != "Eukaryota" &
+    Kingdom != "Unclassified" &
+    !(Phylum %in% c("", "uncharacterized", "p__")) &
+    
+    Family != "Mitochondria" | is.na(Family) &
+    Order != "Chloroplast" | is.na(Order) &
+    Class != "Chloroplast" | is.na(Class) 
+  )
+physeq.7
+
+# function to compare filtered with original
+filtered_TUs <- function(ps_ori, ps_filt) {
+  
+  # extract TU counts
+  count_extract <- function(ps) {
+    filt_otu <- as.data.frame(otu_table(ps)) %>%
+      rowSums() %>%
+      as.data.frame() %>%
+      tibble::rownames_to_column("TU")}
+  ori_tu <- count_extract(ps_ori)
+  filt_tu <- count_extract(ps_filt)
+  
+  # identify removed TUs
+  if (nrow(ori_tu) > nrow(filt_tu)) {
+    otus_removed <- ori_tu %>%
+      anti_join(filt_tu, by = "TU") %>%
+      dplyr::select(TU, "Reads" = ".") %>%
+      dplyr::arrange(desc(Reads)) %>%
+      tibble::column_to_rownames("TU")
+    return(otus_removed)
+  } else return(data.frame())
+}
+amb_phy_df <- filtered_TUs(physeq.6, physeq.7)
+```
+At this step the following `r nrow(amb_phy_df)` TUs with ambiguous or eukaryotic annotation were removed:<br>`r if(nrow(amb_phy_df) == 0) {"**none**"}`
+```{r amb_phylum, eval = nrow(amb_phy_df) > 0, echo = FALSE, out.extra = ''}
+# display df using kable
+kbl(head(amb_phy_df, 10), caption = paste("Overview of the", nrow(amb_phy_df), "TUs excluded.", if(nrow(amb_phy_df) > 10) {"The 10 TUs with highest read count are shown:"}), booktabs = TRUE,
+    linesep = "", format.args = list(big.mark = ",")) %>%
+kable_styling(latex_options = c("striped", "HOLD_position"))
+```
+`r if(TU_type) {"## 4.4 Sequence length distribution\n"} else {"## 4.3 Sequence length distribution\n"}`
+Visualization of how the sequence length distribution of `r if(TU_type) "ZOTU" else "OTU"` has changed after the filtering step.
+```{r seq_length_hist, echo = FALSE, fig.height = 2.8, fig.cap = "Histogram of length distribution of merged reads from all samples (no negative controls and outliers) before (magenta) and after (blue) taxa filering."}
+seq_length_distrib <- function(before, after) {
+  bef <- data.frame(length = as.vector(refseq(before)@ranges@width))
+  aft <- data.frame(length = as.vector(refseq(after)@ranges@width))
+  df <- bind_rows(bef, aft, .id = "origin")
+  lmin <- min(df$length)
+  lmax <- max(df$length)
+  ggplot(df, aes(x = length, fill = origin)) +
+    # geom_histogram(position = "dodge", binwidth = 0.9, bins = 70) +
+    geom_histogram(position = "identity", binwidth = 0.9, bins = lmax - lmin + 10) +
+    theme_light() +
+    coord_cartesian(xlim = c(lmin-5, lmax+5)) +
+    labs(fill = "TU filtering") +
+    scale_fill_manual(values = c("magenta", "skyblue"), labels = c("before", "after")) +
+    xlab("Sequence length [bp]") + ylab('Count')
+}
+seq_length_distrib(physeq.3a, physeq.7)
+```
+\newpage
+# 5. Overviews
+
+Overview of phyla prevalences (presence in fraction of samples) and abundances (counts).
+```{r prevalence}
+# Generate prevalence table (number of samples each taxa occurs in) for each taxa.
+prevelancedf <- apply(X = otu_table(physeq.7),
+                      MARGIN = 1,
+                      FUN = function(x){sum(x > 0)})
+# Add taxonomy and total read counts to this data.frame
+prevelancedf <- data.frame(Prevalence = prevelancedf,
+                           TotalAbundance = taxa_sums(physeq.7),
+                           tax_table(physeq.7))
+colnames(prevelancedf) <- c("Prevalence", "TotalAbundance", colnames(tax_table(physeq.7)))
+prevelancedf <- dplyr::arrange(prevelancedf, desc(TotalAbundance*Prevalence))
+
+# summary on Phylum level
+summary_prevalence <- plyr::ddply(prevelancedf, "Phylum", function(df1){
+  data.frame(mean_prevalence = mean(df1$Prevalence),
+             total_abundance = sum(df1$TotalAbundance, na.rm = TRUE),
+             stringsAsFactors = FALSE)
+}) %>% arrange(desc(total_abundance))
+```
+```{r prevalence_table, results = 'asis', echo = FALSE}
+kbl(summary_prevalence, caption = "Summary of phylum prevalences.", booktabs = TRUE,
+    linesep = "", row.names = FALSE, digits = 2, format.args = list(big.mark = ",")) %>%
+kable_styling(latex_options = c("striped", "HOLD_position"))
+```
+## 5.1 Plots of total abundance (counts) of phyla vs. prevalence in samples.
+```{r prevalence_plot, echo = FALSE, fig.height = 8, fig.cap = "Abundance and prevalence of TUs of different phyla", out.extra = ''}
+# Subset to the remaining phyla by prevalence.
+prevelancedf1 <- subset(prevelancedf, Phylum %in% get_taxa_unique(physeq.7, taxonomic.rank = "Phylum"))
+# overview plot
+ggplot(prevelancedf1, aes(x = TotalAbundance, y = Prevalence / nsamples(physeq.7), color = Phylum)) +
+  geom_point(size = 2, alpha = 0.7) +
+  scale_x_log10() +  xlab("Total Abundance") + ylab("Prevalence [Frac. Samples]") +
+  theme_article() +
+     guides(
+      color = guide_legend(
+        title.position = "top")) +
+  theme(legend.position = "bottom") +
+  facet_wrap(~ Phylum)
+```
+\newpage
+## 5.2 Agglomerate TUs at the genus level
+Combine all TUs with same genus name (name of first TU is kept) while keeping also TUs without genus level assignment.
+```{r agglomerate}
+physeq.8 <- tax_glom(physeq.7, "Genus", NArm = FALSE)
+```
+After applying agglomeration at the genus level, **`r nrow(tax_table(physeq.8))` genera** are present of which **`r length(which(!is.na(tax_table(physeq.8)[,"Genus"])))`** are named.
+
+# 6. Export data
+## 6.1 Export phyloseq objects as list in RDS format
+```{r export_phyloseq}
+# generate empty list to store different phyloseq object filtering steps
+physeq.list <- setNames(vector("list", 11),
+               c("original", "ori_no_ctrls", "no_excluded", "no_low_perf",
+                 "filt_no_ctrls", "no_out", "freq_decontam", "prev_decontam",
+                 "no_ctrls", "no_ambig_euk", "genus_aggl"))
+
+physeq.list[["original"]]            <- physeq
+physeq.list[["ori_no_ctrls"]]        <- physeq.0
+physeq.list[["no_excluded"]]         <- physeq.1
+physeq.list[["no_low_perf"]]         <- physeq.2
+physeq.list[["no_out"]]              <- physeq.3
+physeq.list[["filt_no_ctrls"]]       <- physeq.3a
+if(TU_type) {
+  physeq.list[["freq_decontam"]]     <- physeq.4
+  physeq.list[["prev_decontam"]]     <- physeq.5
+}
+physeq.list[["no_ctrls"]]            <- physeq.6
+physeq.list[["no_ambig_euk"]]        <- physeq.7
+physeq.list[["genus_aggl"]]          <- physeq.8
+
+# remove empty list slots (OTU)
+physeq.list <- physeq.list[lengths(physeq.list) > 0]
+
+# save list of all physeq objects to file
+saveRDS(physeq.list, file = paste0(output_dir1,
+       if(TU_type){"/physeq_list_zotu.rds"} else {"/physeq_list_otu.rds"}))
+```
+\newpage
+**Comparison of the different filtering steps:**
+```{r compare_phyloseq, echo = FALSE}
+# do some comparative statistics of the sequential physeq objects
+physeq.stats <- comparePhyloseq(physeq.list) %>%
+  dplyr::mutate(median = round(sapply(physeq.list, function(x) {median(colSums(otu_table(x)))}), 0),
+                average = round(average.reads, 0)) %>%
+  dplyr::select(input:nsample, min = min.reads, max = max.reads, average, median,
+         total = total.read, singletons:sparsity)
+
+kbl(physeq.stats, caption = "Comparison of phyloseq objects after applying filtering steps.", booktabs = TRUE,
+    linesep = "", format.args = list(big.mark = ",")) %>%
+kable_styling(latex_options = c("striped", "HOLD_position")) %>%
+  add_header_above(c(" " = 3, "Reads" = 5, " " = 2))
+```
+\newpage
+## 6.2 Export fasta and biom after sample filtering
+
+Export data after filtering of samples. No negative controls included.
+```{r export_functions, echo = FALSE}
+# function to export fasta sequences
+incProgress(1/8, message = "Saving...")
+
+export_fasta_physeq <- function(ps, filename) {
+  if(!dir.exists(paste0(params$workdir, "/picrust2"))) {
+    dir.create(paste0(params$workdir, "/picrust2"))}
+  if(!dir.exists(paste0(params$workdir, "/fasta"))) {
+    dir.create(paste0(params$workdir, "/fasta"))}
+  ps %>%
+  refseq() %>%
+  Biostrings::writeXStringSet(
+    paste0(params$workdir, "/", if(TU_type) "picrust2/ZOTU" else "fasta/OTU", "_Seqs_", filename, ".fasta"),
+    append = FALSE, compress = FALSE, compression_level = NA, format = "fasta")
+}
+
+# export TU table as biom file
+export_biom_physeq <- function(ps, filename) {
+  if(!dir.exists(paste0(params$workdir, "/picrust2"))) {
+    dir.create(paste0(params$workdir, "/picrust2"))}
+  biomformat::write_biom(
+  biomformat::make_biom(data = as.matrix(otu_table(ps))), 
+  paste0(params$workdir, "/picrust2/ZOTU_" , filename, ".biom"))
+}
+
+# export TU table in vsearch/Rhea format
+export_table_physeq <- function(ps, filename) {
+  if(!dir.exists(paste0(params$workdir, "/Rhea/1.Normalization"))) {
+    dir.create(paste0(params$workdir, "/Rhea/1.Normalization"))}
+  tu_tab <- phyloseq::otu_table(ps) %>%
+    as.data.frame() %>%
+    rownames_to_column(var = "TU")
+  tax_tab <- tax_table(ps) %>%
+    as.data.frame() %>%
+    rownames_to_column(var = "TU") %>%
+    mutate(Species = "",
+           across(everything(), ~replace_na(.x, ""))) %>%
+    unite(taxonomy, Kingdom:Species, sep = ";")
+  comb_tab <- tu_tab %>%
+    dplyr::left_join(tax_tab, by = "TU") %>%
+    mutate(num = as.numeric(stringr::str_split_i(TU, "_", 2))) %>%
+    arrange(num) %>%
+    dplyr::select(-num) %>%
+    dplyr::rename(`##OTU ID` = TU)
+  write_tsv(comb_tab, 
+    paste0(params$workdir, "/Rhea/1.Normalization/",
+           if(TU_type) "ZOTU" else "OTU", "s_table_", filename, ".tab"),
+    col_names = TRUE)
+}
+
+# export tree file
+export_tree_physeq <- function(ps, filename) {
+  if(!dir.exists(paste0(params$workdir, "/Rhea/3.Beta-Diversity"))) {
+    dir.create(paste0(params$workdir, "/Rhea/3.Beta-Diversity"))}
+  ps_tree <- phy_tree(ps)
+  ape::write.tree(ps_tree,
+   paste0(params$workdir, "/Rhea/3.Beta-Diversity/",
+          if(TU_type) "ZOTU" else "OTU", "s_tree_", filename, ".tree"))
+}
+
+# export metadata as tab file
+export_meta_physeq <- function(ps, filename) {
+  if(!dir.exists(paste0(params$workdir, "/Rhea/3.Beta-Diversity"))) {
+    dir.create(paste0(params$workdir, "/Rhea/3.Beta-Diversity"))}
+  sample_data(ps) %>%
+    as_tibble() %>%
+    dplyr::select(-sample_ID) %>%
+    dplyr::rename(`#SampleID` = sampleID) %>%
+    write_tsv(paste0(params$workdir, "/Rhea/3.Beta-Diversity/",
+                     if(TU_type) "ZOTU" else "OTU", "s_mapping_", filename, ".tab"),
+    col_names = TRUE)
+}
+```
+```{r export_no_controls}
+# export fasta sequences
+export_fasta_physeq(physeq.3a, "noctrls")
+
+# export TU table as biom file (ZOTU/ASV only)
+if(TU_type) {
+export_biom_physeq(physeq.3a, "noctrls")}
+
+# export TU table as tab file
+export_table_physeq(physeq.3a, "noctrls")
+
+# export tree in file
+export_tree_physeq(physeq.3a, "noctrls")
+
+# export metadata /mapping file
+export_meta_physeq(physeq.3a, "noctrls")
+```
+## 6.3 Export fasta and biom after sample and TU filtering
+
+Export data after filtering of samples and TUs (ambiguous annotation, decontamination).  No negative controls included.
+```{r export_decontam}
+# export fasta sequences
+export_fasta_physeq(physeq.7, "noctrls_decontam")
+
+# export TU table as biom file (ZOTU/ASV only)
+if(TU_type) {
+export_biom_physeq(physeq.7, "noctrls_decontam")}
+
+# export TU table as tab file
+export_table_physeq(physeq.7, "noctrls_decontam")
+
+# export tree in file
+export_tree_physeq(physeq.7, "noctrls_decontam")
+
+# export metadata /mapping file
+export_meta_physeq(physeq.7, "noctrls_decontam")
+```
+\newpage
+# 7. Record session information
+\tiny
+```{r session_info, echo = FALSE}
+print(sessionInfo())
+```
